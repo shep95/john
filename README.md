@@ -1,105 +1,184 @@
-# john algro bot
+<div align="center">
 
-a non-ai, rules-based perpetual-futures bot that turns **john's chart narrative**
-into a concrete algorithm and trades it on **hyperliquid** with **5x leverage** on
-the **5m chart**, rotating **ETH ↔ DOGE**. hosted on **railway**.
+# ◢ JOHN ◣
 
-there is no model and no runtime learning. every decision is deterministic math
-over the last N closed candles — exactly the primitives john described.
+### `narrative → algorithm` · a non-ai perpetual-futures engine
 
-## the core idea (narrative -> code)
+**movement + context + velocity = meaning.** john's chart thesis, compiled into
+deterministic math and traded live on hyperliquid.
 
-john's thesis: *movement + context + velocity = meaning*, and the real unit is the
-**relationship between movements**, not candle shape. the algorithm reads each 5m
-frame like this:
+<br>
 
-1. **volatility / normal rate** — `atr` and average body/range set the environment
-   so every measurement is normalized (velocity is contextual, not raw price).
-2. **micro-war** — over a ~7-candle window, sum `buyer_force` vs `seller_force`
-   (body + wick-defense, recency-weighted) → `dominance` and a `winner`.
-3. **war resolved?** — only when dominance passes a threshold **and** velocity is
-   accelerating in the winner's direction. high two-sided energy = *bouncing* → no trade.
-4. **passion point** — the most contested candle (size + range + rejection wicks),
-   scored with **persistence, repetition, defense, echo** so a small stubborn move
-   can out-rank a big empty one (john's movement A vs B).
-5. **echo** — the follow-through after the passion point: direction, length, latency,
-   magnitude. reinforcement = same side as the winner.
-6. **decision** — *winner + echo direction and length → LONG / SHORT*. anything
-   unclear or blank → **no trade, wait for context**.
-7. **SL/TP** — scaled by `conviction` (passion + echo + dominance). higher conviction
-   → **tighter SL, wider TP** → better reward:risk, riding the resolved war's inertia.
+![python](https://img.shields.io/badge/python-3.12-0b0f19?style=for-the-badge&logo=python&logoColor=7cf5c4&labelColor=0b0f19)
+![exchange](https://img.shields.io/badge/exchange-hyperliquid-0b0f19?style=for-the-badge&logoColor=7cf5c4&labelColor=0b0f19)
+![deploy](https://img.shields.io/badge/deploy-railway-0b0f19?style=for-the-badge&logo=railway&logoColor=7cf5c4&labelColor=0b0f19)
+<br>
+![engine](https://img.shields.io/badge/engine-deterministic-7cf5c4?style=for-the-badge&labelColor=0b0f19)
+![leverage](https://img.shields.io/badge/leverage-5x_isolated-7cf5c4?style=for-the-badge&labelColor=0b0f19)
+![default](https://img.shields.io/badge/default-paper_safe-ff5f8f?style=for-the-badge&labelColor=0b0f19)
 
-file map: `analysis.py` (narrative math) · `strategy.py` (sizing + SL/TP) ·
-`broker.py` (paper + live hyperliquid) · `engine.py` (loop, rotation, cooldown).
+`5m chart` · `ETH ⇄ DOGE rotation` · `no model · no runtime learning`
 
-## behavior
+</div>
 
-- **5m chart**, one position at a time.
-- **rotation**: after each closed trade, switch active symbol ETH → DOGE → ETH …
-- **cooldown = last trade's duration**: if a trade took 40m to hit TP/SL, the bot
-  waits ~40m before the next one (clamped by `MIN/MAX_COOLDOWN_SEC`).
-- **TP/SL on-exchange**: live trades place reduce-only trigger orders so exits are
-  automatic even if the bot restarts.
-- **5x isolated leverage** (configurable).
-- **compounding**: 40% of every profit is compounded back into the sizing base;
-  the other 60% is *banked* (set aside). losses come out of the sizing base. all
-  position sizing is `RISK_FRAC` of the compounding base, so wins grow the size.
+---
 
-## discord (alerts + commands)
+> [!NOTE]
+> there is no ai here. every decision is deterministic math over the last N
+> closed candles — exactly the primitives john described. nothing is fit,
+> trained, or learned at runtime.
 
-set `DISCORD_BOT_TOKEN` + `DISCORD_CHANNEL_ID` (and optionally `DISCORD_GUILD_ID`
-for instant command sync, `DISCORD_USER_ID` to get pinged). the bot then:
+<br>
 
-- 📈 alerts on **entry** — side, size, entry, TP/SL with **estimated profit & loss**,
-  reward:risk, conviction.
-- ✅/🛑 alerts on **exit** — result, trade pnl, held time, **compounded 40% vs
-  banked 60%**, new sizing base, and **overall realized pnl + W/L record**.
-- slash commands: `/status` `/position` `/pnl` `/pause` `/resume` `/flatten` `/params`.
+## ◇ the pipeline
 
-no privileged intents needed (slash commands only). alerts-only? just set
-`DISCORD_WEBHOOK_URL` and skip the token.
+each closed 5m frame is compiled through seven stages. the unit is the
+**relationship between movements**, never the candle shape.
 
-**bot setup**: discord developer portal → new application → Bot → copy token →
-invite with `applications.commands` + `bot` scopes and "Send Messages" perm →
-put the target channel id in `DISCORD_CHANNEL_ID`.
+```
+   candles ─▶ [1] volatility / normal rate      atr · avg body/range  →  everything normalized
+             [2] micro-war                      Σ buyer_force vs seller_force (recency-weighted)
+             [3] war resolved?                  |dominance| ≥ θ  AND  velocity accelerating
+             [4] passion point                  most-contested candle: size·range·rejection·defense
+             [5] echo                            follow-through: direction · length · latency · magnitude
+             [6] decision                        winner + echo  →  LONG · SHORT · NO-TRADE
+             [7] SL / TP                          conviction  →  tighter stop, wider target
+                                                                     │
+                                                                     ▼
+                                                              sized order + on-exchange TP/SL
+```
 
-## quick start (paper, no keys)
+<table>
+<tr><td width="55%">
+
+**what makes it "john"**
+
+- a **small stubborn** move can out-rank a **big empty** one — passion weights
+  persistence, repetition, defense and echo, not raw body size.
+- **both sides loud = bouncing** → no trade. it only fires when one side has
+  established directional velocity.
+- **persistence vs exhaustion** is one primitive read by direction, not two
+  hardcoded labels.
+- unclear or blank → **wait for context.**
+
+</td><td width="45%">
+
+**file map**
+
+| module | role |
+| --- | --- |
+| `analysis.py` | narrative → math, the read |
+| `strategy.py` | sizing + SL/TP shaping |
+| `broker.py` | paper + live hyperliquid |
+| `engine.py` | loop · rotation · cooldown |
+| `market.py` | keyless 5m candle feed |
+| `notify.py` | discord alerts + commands |
+
+</td></tr>
+</table>
+
+<br>
+
+## ◇ behavior
+
+| trait | rule |
+| --- | --- |
+| **cadence** | 5m chart · one position at a time |
+| **rotation** | after every close, flip active symbol `ETH → DOGE → ETH …` |
+| **cooldown** | equals the *last trade's* duration — a 40m trade → ~40m wait (clamped `MIN/MAX_COOLDOWN_SEC`) |
+| **exits** | live places **reduce-only trigger orders** on-exchange, so TP/SL fire even if the bot is down |
+| **leverage** | 5x isolated (configurable) |
+| **compounding** | **40%** of each profit compounds into the sizing base, **60%** is banked; losses come out of the base, so wins grow position size |
+| **restart-safe** | the open trade is persisted and, in live mode, **reconciled directly from the exchange** on boot — no double-open, no lost position |
+
+<br>
+
+## ◇ discord — alerts + commands
+
+set `DISCORD_BOT_TOKEN` + `DISCORD_CHANNEL_ID` (optionally `DISCORD_GUILD_ID`
+for instant command sync, `DISCORD_USER_ID` to get pinged):
+
+- 📈 **entry** — side, size, entry, TP/SL with estimated P&L, reward:risk, conviction.
+- ✅ / 🛑 **exit** — result, trade pnl, held time, compounded 40% vs banked 60%, new sizing base, realized pnl + W/L record.
+- ⌨️ **slash commands** — `/status` `/position` `/pnl` `/pause` `/resume` `/flatten` `/params`
+
+> [!TIP]
+> alerts-only, no commands? just set `DISCORD_WEBHOOK_URL` and skip the token.
+> no privileged intents are required (slash commands only).
+
+<details>
+<summary><b>bot setup (click)</b></summary>
+
+<br>
+
+1. discord developer portal → **new application** → **Bot** → copy token.
+2. invite with the `applications.commands` + `bot` scopes and the **Send Messages** permission.
+3. put the target channel id in `DISCORD_CHANNEL_ID`.
+
+</details>
+
+<br>
+
+## ◇ quick start — paper, no keys
 
 ```bash
 pip install -r requirements.txt
 
 # backtest / self-test on real recent candles
-python -m john_bot.backtest              # ETH + DOGE, 500 candles
+python -m john_bot.backtest            # ETH + DOGE, 500 candles
 python -m john_bot.backtest ETH 1000
 
 # run the live loop in PAPER mode (simulated fills on live data)
 python -m john_bot
 ```
 
-## going live on hyperliquid
+paper trading on live data is **on by default** — it never touches real funds
+until you explicitly flip `DRY_RUN=false` and supply a key.
 
-1. create an **API wallet** (agent key) in the hyperliquid UI — never use your main
-   withdrawal key.
-2. set env: `DRY_RUN=false`, `HL_PRIVATE_KEY=<api wallet key>`,
-   `HL_ACCOUNT_ADDRESS=<your main account address>`.
-3. optionally `HL_TESTNET=true` to rehearse on testnet first.
+<br>
 
-all knobs live in `.env.example`.
+## ◇ going live on hyperliquid
 
-## deploy to railway
+```ini
+DRY_RUN=false
+HL_PRIVATE_KEY=<api wallet / agent key>     # NOT your main withdrawal key
+HL_ACCOUNT_ADDRESS=<your main account address>
+HL_TESTNET=true                             # optional: rehearse on testnet first
+```
 
-1. push this repo to github (or use `railway up`).
+> [!IMPORTANT]
+> use a hyperliquid **API wallet (agent key)** — never your main withdrawal key.
+> every knob lives in [`.env.example`](.env.example).
+
+<br>
+
+## ◇ deploy to railway
+
+1. push this repo to github (or `railway up`).
 2. `railway init` → new project → deploy from repo.
-3. add variables from `.env.example` in the railway dashboard (at minimum set
-   `DRY_RUN`, and for live: `HL_PRIVATE_KEY` + `HL_ACCOUNT_ADDRESS`).
+3. add variables from `.env.example` in the dashboard (at minimum `DRY_RUN`; for live, `HL_PRIVATE_KEY` + `HL_ACCOUNT_ADDRESS`).
 4. railway runs the `worker` process (`python -m john_bot`) with auto-restart.
 
-`state.json` persists rotation/cooldown/stats; railway's ephemeral fs resets on
-redeploy, which is fine (the bot re-derives everything from the live feed).
+> [!NOTE]
+> `state.json` persists rotation, cooldown, stats and the open trade. railway's
+> filesystem is ephemeral, so it can reset on redeploy — in **live** mode the bot
+> recovers any open position straight from the exchange, and its on-exchange TP/SL
+> keep protecting it regardless. attach a railway volume if you want the local
+> state to survive redeploys too.
 
-## risk note
+<br>
 
-trading perps with leverage can lose the whole margin. defaults are conservative
-(paper on, 2% risk/trade, isolated 5x). backtest results are hypothetical, ignore
-funding/slippage beyond a taker-fee estimate, and are **not** a guarantee. start on
-testnet or small size.
+## ◇ risk
+
+> [!CAUTION]
+> trading perps with leverage can lose your entire margin. defaults are
+> conservative (paper on, 2% risk/trade, isolated 5x), but backtest results are
+> hypothetical, ignore funding and most slippage beyond a taker-fee estimate, and
+> guarantee nothing. **start on testnet or tiny size.**
+
+<div align="center">
+<br>
+
+`deterministic · auditable · non-ai`
+
+</div>
