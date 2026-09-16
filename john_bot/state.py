@@ -7,7 +7,7 @@ import json
 import os
 import tempfile
 from dataclasses import asdict, dataclass, field
-from typing import List
+from typing import List, Optional
 
 
 @dataclass
@@ -37,14 +37,22 @@ class BotState:
     banked_reserve: float = 0.0     # profit set aside (the 60% not compounded)
     start_base: float = 0.0         # first sizing_base, for roi
     paused: bool = False
+    # the currently-open trade, persisted so a restart (railway redeploy) does
+    # not lose track of a live position. None when flat. keys mirror the fields
+    # a broker needs to resume settling: symbol, side, is_buy, size, entry,
+    # stop_loss, take_profit, opened_at.
+    open_position: Optional[dict] = None
 
     def record(self, t: TradeRecord) -> None:
         self.trades.append(asdict(t))
         self.trades = self.trades[-500:]
         self.realized_pnl += t.pnl
-        if t.pnl >= 0:
+        # a win is real profit; a loss is real loss. an exact breakeven (after
+        # fees, vanishingly rare) is counted as neither so it never inflates the
+        # win column.
+        if t.pnl > 0:
             self.wins += 1
-        else:
+        elif t.pnl < 0:
             self.losses += 1
         self.last_trade_duration = t.duration_sec
 

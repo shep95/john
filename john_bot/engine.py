@@ -48,9 +48,35 @@ class Engine:
             self.state.sizing_base = base
             self.state.start_base = base
 
+        # resume tracking any position that was open before a restart
+        self._restore_open_position()
+
         # discord (bot with commands, or webhook alerts, or silent)
         self.notifier = make_notifier(cfg, self)
         self.notifier.start()
+
+    def _restore_open_position(self) -> None:
+        """after a restart (railway redeploy), re-adopt the open position so the
+        bot keeps managing it instead of opening a second one. first from the
+        persisted state, then reconciled against the exchange in live mode in
+        case the state was lost or stale."""
+        d = self.state.open_position
+        if d:
+            try:
+                self.broker.restore_position(d)
+            except Exception as e:
+                self.log.warning("could not restore persisted position: %s", e)
+        if hasattr(self.broker, "sync_from_exchange"):
+            try:
+                self.broker.sync_from_exchange()
+            except Exception as e:
+                self.log.warning("exchange position sync failed: %s", e)
+        # keep persisted state consistent with whatever we actually hold now
+        pos = self.broker.any_position()
+        if pos is None:
+            self.state.open_position = None
+        else:
+            self.state.open_position = self._position_dict(pos)
 
     # -- helpers -------------------------------------------------------------
     def active_symbol(self) -> str:
@@ -63,6 +89,15 @@ class Engine:
         if symbol not in self._sz_dec:
             self._sz_dec[symbol] = self.market.sz_decimals(symbol)
         return self._sz_dec[symbol]
+
+    @staticmethod
+    def _position_dict(pos) -> dict:
+        """serialise an open Position for state.json (restart persistence)."""
+        return {
+            "symbol": pos.symbol, "side": pos.side, "is_buy": pos.is_buy,
+            "size": pos.size, "entry": pos.entry, "stop_loss": pos.stop_loss,
+            "take_profit": pos.take_profit, "opened_at": pos.opened_at,
+        }
 
     def _cooldown_from(self, closed: ClosedTrade) -> float:
         if self.cfg.cooldown_mode == "none":
@@ -91,6 +126,7 @@ class Engine:
         return compounded, banked
 
     def _finish_trade(self, closed: ClosedTrade) -> None:
+        self.state.open_position = None  # flat again -> nothing to resume on restart
         self.state.record(TradeRecord(
             symbol=closed.symbol, side=closed.side, entry=closed.entry, exit=closed.exit,
             pnl=closed.pnl, reason=closed.reason, opened_at=closed.opened_at,
@@ -163,6 +199,10 @@ class Engine:
         self.log.info("%s SIGNAL %s | %s", symbol, read.signal, read.reason)
         opened = self.broker.open(plan)
         if opened:
+            pos = self.broker.any_position()
+            # persist the open trade so a restart resumes it instead of
+            # double-opening on the rotated symbol
+            self.state.open_position = self._position_dict(pos) if pos else None
             self._alert_entry(plan)
             save_state(self.cfg.state_path, self.state)
 
