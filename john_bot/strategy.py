@@ -16,6 +16,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .analysis import LONG, MarketRead, NO_TRADE, SHORT, _clip
+from .logutil import get_logger
+
+log = get_logger()
 
 
 def round_px(px: float, sz_decimals: int) -> float:
@@ -79,6 +82,8 @@ def build_plan(read: MarketRead, equity: float, sz_decimals: int, cfg) -> "Trade
     risk_amount = equity * cfg.risk_frac
     stop_dist_price = abs(entry - sl)
     if stop_dist_price <= 0:
+        log.warning("[sizing] rejected %s: stop distance is 0 (entry=%.6g sl=%.6g)",
+                    read.symbol, entry, sl)
         return None
     size = risk_amount / stop_dist_price
 
@@ -91,6 +96,13 @@ def build_plan(read: MarketRead, equity: float, sz_decimals: int, cfg) -> "Trade
 
     size = round(size, sz_decimals)
     if size <= 0:
+        log.warning(
+            "[sizing] rejected %s: size rounds to 0. equity=%.4f risk_amt=%.4f "
+            "entry=%.6g stop_dist=%.6g raw_size=%.8f sz_decimals=%d -> fund the "
+            "account or lower risk; equity here is the sizing base.",
+            read.symbol, equity, risk_amount, entry, stop_dist_price,
+            risk_amount / stop_dist_price, sz_decimals,
+        )
         return None
     notional = size * entry
 

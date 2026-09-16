@@ -193,7 +193,8 @@ class Engine:
         base = self.state.sizing_base
         plan = build_plan(read, base, self.sz_decimals(symbol), self.cfg)
         if plan is None:
-            self.log.info("%s signal %s but no valid plan (sizing)", symbol, read.signal)
+            self.log.info("%s signal %s but no valid plan (sizing_base=%.4f, live_equity=%.4f)",
+                          symbol, read.signal, base, self.broker.equity())
             return
 
         self.log.info("%s SIGNAL %s | %s", symbol, read.signal, read.reason)
