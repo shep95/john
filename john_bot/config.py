@@ -84,24 +84,44 @@ class Config:
     discord_webhook_url: str = field(default_factory=lambda: _s("DISCORD_WEBHOOK_URL", ""))
     discord_user_id: str = field(default_factory=lambda: _s("DISCORD_USER_ID", ""))
 
-    # --- analysis windows (narrative sections 4 & 9) ---
-    war_window: int = field(default_factory=lambda: _i("WAR_WINDOW", 7))  # ~6-7 candle micro-war
-    atr_lookback: int = field(default_factory=lambda: _i("ATR_LOOKBACK", 14))
+    # --- analysis windows (asherin.pine :: core windows) ---
+    war_window: int = field(default_factory=lambda: _i("WAR_WINDOW", 7))       # warWin
+    atr_lookback: int = field(default_factory=lambda: _i("ATR_LOOKBACK", 14))  # atrLen
+    frame_len: int = field(default_factory=lambda: _i("FRAME_LEN", 50))        # frameLen
+    normal_len: int = field(default_factory=lambda: _i("NORMAL_LEN", 50))      # normLen
     history_candles: int = field(default_factory=lambda: _i("HISTORY_CANDLES", 120))
 
-    # --- signal gates (narrative sections 5, 7, 17) ---
-    dominance_threshold: float = field(default_factory=lambda: _f("DOMINANCE_THRESHOLD", 0.35))
-    echo_min_len: int = field(default_factory=lambda: _i("ECHO_MIN_LEN", 2))
-    conflict_ceiling: float = field(default_factory=lambda: _f("CONFLICT_CEILING", 0.72))
-    passion_min: float = field(default_factory=lambda: _f("PASSION_MIN", 0.0))
+    # --- velocity / trend gates (asherin.pine :: velocity/trend) ---
+    trend_thresh: float = field(default_factory=lambda: _f("TREND_THRESH", 0.25))  # trendThresh
+    dom_thresh: float = field(default_factory=lambda: _f("DOM_THRESH", 2.0))       # domThresh (net force)
 
-    # --- SL/TP shaping (narrative: passion + echo guide SL/TP) ---
-    sl_atr_base: float = field(default_factory=lambda: _f("SL_ATR_BASE", 1.6))
-    tp_atr_base: float = field(default_factory=lambda: _f("TP_ATR_BASE", 1.6))
-    # conviction (passion+echo) shrinks SL and expands TP -> "lower SL, higher TP"
-    sl_conviction_shrink: float = field(default_factory=lambda: _f("SL_CONVICTION_SHRINK", 0.45))
-    tp_conviction_grow: float = field(default_factory=lambda: _f("TP_CONVICTION_GROW", 1.6))
-    min_sl_atr: float = field(default_factory=lambda: _f("MIN_SL_ATR", 0.8))
+    # --- passion weights (asherin.pine :: passion) ---
+    w_mag: float = field(default_factory=lambda: _f("W_MAG", 0.20))
+    w_conf: float = field(default_factory=lambda: _f("W_CONF", 0.35))
+    w_wick: float = field(default_factory=lambda: _f("W_WICK", 0.25))
+    w_pers: float = field(default_factory=lambda: _f("W_PERS", 0.20))
+    passion_thresh: float = field(default_factory=lambda: _f("PASSION_THRESH", 1.00))
+
+    # --- echo / normal rate (asherin.pine :: echo) ---
+    echo_trigger: float = field(default_factory=lambda: _f("ECHO_TRIGGER", 1.6))
+    echo_max: int = field(default_factory=lambda: _i("ECHO_MAX", 6))
+    elong_mult: float = field(default_factory=lambda: _f("ELONG_MULT", 1.5))
+    const_mult: float = field(default_factory=lambda: _f("CONST_MULT", 0.6))
+
+    # --- stubborn / precursor / conflict (asherin.pine) ---
+    stub_body: float = field(default_factory=lambda: _f("STUB_BODY", 0.25))
+    prec_size: float = field(default_factory=lambda: _f("PREC_SIZE", 0.60))
+    prec_count: int = field(default_factory=lambda: _i("PREC_COUNT", 3))
+    conflict_thresh: float = field(default_factory=lambda: _f("CONFLICT_THRESH", 0.8))
+    tap_tol: float = field(default_factory=lambda: _f("TAP_TOL", 0.25))
+    piv_len: int = field(default_factory=lambda: _i("PIV_LEN", 3))
+
+    # --- SL/TP shaping (asherin.pine :: trade) ---
+    base_sl: float = field(default_factory=lambda: _f("BASE_SL", 2.0))
+    base_tp: float = field(default_factory=lambda: _f("BASE_TP", 3.0))
+    sl_sens: float = field(default_factory=lambda: _f("SL_SENS", 0.60))
+    tp_sens: float = field(default_factory=lambda: _f("TP_SENS", 1.00))
+    sl_floor: float = field(default_factory=lambda: _f("SL_FLOOR", 0.50))
 
     # --- timing / cooldown (narrative: cooldown = last trade duration) ---
     poll_seconds: int = field(default_factory=lambda: _i("POLL_SECONDS", 20))

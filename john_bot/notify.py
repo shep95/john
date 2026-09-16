@@ -225,8 +225,9 @@ class BotNotifier:
             e.add_field(name="risk/trade", value=f"{cfg.risk_frac*100:.1f}%", inline=True)
             e.add_field(name="compound", value=f"{cfg.compound_frac*100:.0f}%", inline=True)
             e.add_field(name="war window", value=str(cfg.war_window), inline=True)
-            e.add_field(name="dominance thr", value=f"{cfg.dominance_threshold}", inline=True)
-            e.add_field(name="echo min len", value=str(cfg.echo_min_len), inline=True)
+            e.add_field(name="dom thr (net force)", value=f"{cfg.dom_thresh}", inline=True)
+            e.add_field(name="trend thr", value=f"{cfg.trend_thresh}", inline=True)
+            e.add_field(name="echo max", value=str(cfg.echo_max), inline=True)
             e.add_field(name="cooldown", value=cfg.cooldown_mode, inline=True)
             await interaction.response.send_message(embed=e)
 

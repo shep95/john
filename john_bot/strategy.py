@@ -50,14 +50,13 @@ def build_plan(read: MarketRead, equity: float, sz_decimals: int, cfg) -> "Trade
         return None
 
     atr_v = read.atr
-    c = read.conviction
+    c = read.conviction  # = strength, matching the indicator
 
-    # distances in atr units, shaped by conviction (section: passion guides SL/TP)
-    sl_atr = cfg.sl_atr_base * (1.0 - cfg.sl_conviction_shrink * c)
-    sl_atr = max(sl_atr, cfg.min_sl_atr)
-    tp_atr = cfg.tp_atr_base * (1.0 + cfg.tp_conviction_grow * c)
-    # elongation of the pattern (section 9) nudges the target a little wider/tighter
-    tp_atr *= _clip(read.elongation, 0.8, 1.6)
+    # SL/TP in atr units, shaped by strength -- identical to asherin.pine:
+    #   slMult = max(slFloor, baseSL * (1 - slSens * strength))   (tighter when strong)
+    #   tpMult = baseTP * (1 + tpSens * strength)                 (wider when strong)
+    sl_atr = max(cfg.sl_floor, cfg.base_sl * (1.0 - cfg.sl_sens * c))
+    tp_atr = cfg.base_tp * (1.0 + cfg.tp_sens * c)
 
     sl_dist = sl_atr * atr_v
     tp_dist = tp_atr * atr_v

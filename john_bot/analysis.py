@@ -1,23 +1,17 @@
-"""analysis engine -- john's narrative turned into deterministic math.
+"""analysis engine -- a faithful 1:1 port of the `asherin.pine` TradingView
+indicator so the live bot fires on the SAME conditions the chart shows.
 
-the whole point (narrative section 24): the unit is the *relationship between
-movements*, not the candle shape. so we never say "shape X => buy". we measure
-movement + context + velocity, detect the micro-war winner, read the echo that
-follows the passion point, and only then derive a directional interpretation.
+every threshold, weight and formula below mirrors asherin.pine (same defaults):
+  - ATR = Wilder RMA (ta.atr), atrLen=14
+  - netForce = sum(body/atr, warWin), dominance gate = |netForce| >= domThresh(2.0)
+  - normVel = (close - close[warWin]) / warWin / atr, trend gate = |normVel| >= trendThresh(0.25)
+  - warResolved = |normVel|>=trendThresh AND |netForce|>=domThresh AND trendDir==netDir
+  - winner + echo direction (echoDir) must agree -> LONG/SHORT, else wait
+  - passion = wMag*rngN + wConf*(conflictDensity*3) + wWick*wickN + wPers*(persistence*3)
+  - strength = clip((passionRel/2 + echoStrength)/2, 0, 1)  -> drives SL/TP in strategy.py
 
-section map (narrative -> code):
-  1  movement + context + velocity = meaning ...... every primitive is /atr normalized
-  2  trend is velocity (normalized by volatility) . velocity_norm, atr
-  3  frame = contextual position ................... window slice + recency weights
-  4  market = competing movement (micro-war) ....... buyer_force / seller_force
-  5  war ends on directional dominance ............. dominance, winner, war_resolved
-  6  passion point != big candle ................... passion_point + passion score
-  7  echoes reveal interaction after a move ........ Echo (latency/len/dir/magnitude)
-  8  passion = persistence + conflict, not size .... persistence/repetition/defense weights
-  9  normal rate belongs to the pattern ............ normal_body/range, elongation
-  11 persistence vs exhaustion = same primitive .... directional dominance, label derived late
-  13 double taps / contradictory sub-moves ......... conflict_density, double_taps
-  17 both sides high velocity = bouncing ........... conflict balance -> no-trade gate
+the MarketRead fields are kept for the engine / notify / backtest consumers, but
+their meaning now follows the indicator (dominance holds netForce, etc.).
 """
 from __future__ import annotations
 
@@ -36,263 +30,208 @@ def _clip(x: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, x))
 
 
-def _logistic(x: float) -> float:
-    return 1.0 / (1.0 + math.exp(-x))
+def _sign(x: float) -> int:
+    return 1 if x > 0 else (-1 if x < 0 else 0)
 
 
 # ---------------------------------------------------------------------------
-# section 2 & 9 -- volatility (the environment) and the pattern's normal rate
+# ATR series -- Wilder RMA of true range, matching pine's ta.atr(atrLen)
 # ---------------------------------------------------------------------------
-def atr(candles: List[Candle], lookback: int) -> float:
-    if len(candles) < 2:
-        return candles[-1].rng if candles else 1e-9
-    trs = []
-    for i in range(1, len(candles)):
-        c, p = candles[i], candles[i - 1]
-        trs.append(max(c.high - c.low, abs(c.high - p.close), abs(c.low - p.close)))
-    window = trs[-lookback:]
-    return max(sum(window) / len(window), 1e-9)
-
-
-def normal_body(candles: List[Candle], lookback: int) -> float:
-    w = candles[-lookback:]
-    return max(sum(c.abs_body for c in w) / len(w), 1e-9)
-
-
-def normal_range(candles: List[Candle], lookback: int) -> float:
-    w = candles[-lookback:]
-    return max(sum(c.rng for c in w) / len(w), 1e-9)
+def _atr_series(candles: List[Candle], length: int) -> List[float]:
+    n = len(candles)
+    trs: List[float] = []
+    for i in range(n):
+        if i == 0:
+            trs.append(candles[0].rng)
+        else:
+            c, p = candles[i], candles[i - 1]
+            trs.append(max(c.high - c.low, abs(c.high - p.close), abs(c.low - p.close)))
+    atrs: List[float] = []
+    rma: Optional[float] = None
+    for i in range(n):
+        if i < length - 1:
+            rma_run = sum(trs[: i + 1]) / (i + 1)  # running mean until warmed
+            atrs.append(max(rma_run, 1e-9))
+        elif i == length - 1:
+            rma = sum(trs[:length]) / length
+            atrs.append(max(rma, 1e-9))
+        else:
+            rma = (rma * (length - 1) + trs[i]) / length  # type: ignore[operator]
+            atrs.append(max(rma, 1e-9))
+    return atrs
 
 
 # ---------------------------------------------------------------------------
-# section 7 -- the echo after the passion point
+# echo -- same construct as the indicator (var-state replayed over the series)
 # ---------------------------------------------------------------------------
 @dataclass
 class Echo:
-    direction: int = 0          # net direction of the follow-through
-    length: int = 0             # consecutive candles continuing the winner's way
-    latency: int = 0            # candles until the first real response
-    magnitude: float = 0.0      # summed follow-through body, /atr
-    micro_count: int = 0        # small "micro candle echoes" after the point
+    direction: int = 0
+    length: int = 0
+    latency: int = 0
+    magnitude: float = 0.0
+    micro_count: int = 0
     reinforces_winner: bool = False
 
 
-def read_echo(window: List[Candle], point_idx: int, winner: int, atr_v: float, norm_body: float) -> Echo:
-    """narrative section 7 & 13: the sequence of smaller movements after the
-    initial (passion) movement. timing (latency), magnitude, direction, length.
-    reinforcement = follow-through on the winner's side; opposition = against it.
-    """
-    echo = Echo()
-    tail = window[point_idx + 1:]
-    if not tail:
-        return echo
-
-    # latency: candles until the first non-trivial response
-    latency = 0
-    for c in tail:
-        latency += 1
-        if c.abs_body > 0.2 * atr_v:
-            break
-    echo.latency = latency
-
-    # net follow-through direction + magnitude
-    net = sum(c.body for c in tail)
-    echo.direction = 1 if net > 0 else (-1 if net < 0 else 0)
-    echo.magnitude = sum(c.abs_body for c in tail) / atr_v
-
-    # length: consecutive candles continuing in the winner's direction,
-    # tolerating tiny (sub-normal) candles as continuation, breaking on a
-    # strong opposite candle.
-    length = 0
-    for c in tail:
-        if c.direction == winner or c.abs_body < 0.35 * norm_body:
-            length += 1
-        else:
-            break
-    echo.length = length
-
-    echo.micro_count = sum(1 for c in tail if c.abs_body < norm_body)
-    echo.reinforces_winner = echo.direction == winner and winner != 0
-    return echo
-
-
-# ---------------------------------------------------------------------------
-# the full read of the current frame
-# ---------------------------------------------------------------------------
 @dataclass
 class MarketRead:
     symbol: str
     price: float
     atr: float
     normal_body: float
-    # micro-war (sections 4,5)
     buyer_force: float
     seller_force: float
-    dominance: float            # [-1,1], sign = winner
-    winner: int                 # +1 buyers, -1 sellers, 0 none
+    dominance: float            # NOTE: holds netForce = sum(body/atr, warWin)
+    winner: int
     war_resolved: bool
     velocity_established: bool
-    conflict: float             # [0,1], balance of forces (1 = perfect bounce)
+    conflict: float             # conflictDensity [0,1]
     total_energy: float
-    # passion (sections 6,8)
-    passion: float              # [0,1] inferred passion of the winning move
-    passion_idx: int            # index in window of the passion point
-    elongation: float           # passion range / normal range (section 9)
-    double_taps: int            # repeated contradictory activations (section 13)
-    persistence: float          # fraction of window on winner's side (section 8)
-    # echo (section 7)
+    passion: float              # indicator passion (can exceed 1)
+    passion_idx: int
+    elongation: float
+    double_taps: int
+    persistence: float
     echo: Echo = field(default_factory=Echo)
-    # verdict
     signal: str = NO_TRADE
-    conviction: float = 0.0     # [0,1]
+    conviction: float = 0.0     # strength [0,1]
     reason: str = ""
 
 
 def analyze(symbol: str, candles: List[Candle], cfg) -> MarketRead:
-    """turn closed candles into a full MarketRead. deterministic, no model."""
+    """port of asherin.pine's per-bar read, evaluated on the latest closed bar."""
     n = len(candles)
     price = candles[-1].close if candles else 0.0
-    atr_v = atr(candles, cfg.atr_lookback)
-    norm_body = normal_body(candles, cfg.atr_lookback)
-    norm_rng = normal_range(candles, cfg.atr_lookback)
 
-    W = min(cfg.war_window, n)
-    window = candles[-W:]
+    atr_len = cfg.atr_lookback
+    W = cfg.war_window
+    need = max(cfg.frame_len, cfg.normal_len, atr_len, W) + 2
 
-    if n < max(cfg.war_window, 3):
+    if n < need:
         return MarketRead(
-            symbol=symbol, price=price, atr=atr_v, normal_body=norm_body,
+            symbol=symbol, price=price, atr=1e-9, normal_body=1e-9,
             buyer_force=0, seller_force=0, dominance=0, winner=0,
             war_resolved=False, velocity_established=False, conflict=0, total_energy=0,
-            passion=0, passion_idx=max(0, W - 1), elongation=1.0, double_taps=0,
-            persistence=0, echo=Echo(), signal=NO_TRADE, conviction=0.0,
-            reason="not enough candles yet",
+            passion=0, passion_idx=0, elongation=1.0, double_taps=0, persistence=0,
+            echo=Echo(), signal=NO_TRADE, conviction=0.0,
+            reason=f"warming up ({n}/{need} candles)",
         )
 
-    # ----- section 4: competing movement -> buyer/seller force -----
-    # each candle pushes its direction via body; wick rejections count as
-    # *defense* (buyers holding lows / sellers capping highs). recent candles
-    # weigh more (section 3: frame = where we are inside the context).
-    wick_w = 0.5
-    buyer_force = seller_force = 0.0
-    for i, c in enumerate(window):
-        rw = (i + 1) / W  # recency weight, newest heaviest
-        buyer_push = (max(c.body, 0.0) + wick_w * c.lower_wick) / atr_v
-        seller_push = (max(-c.body, 0.0) + wick_w * c.upper_wick) / atr_v
-        buyer_force += rw * buyer_push
-        seller_force += rw * seller_push
+    atrs = _atr_series(candles, atr_len)
+    L = n - 1
+    atr_cur = atrs[L]
 
-    total = buyer_force + seller_force + 1e-9
-    dominance = (buyer_force - seller_force) / total
-    winner = 1 if dominance > 0 else (-1 if dominance < 0 else 0)
+    c0 = candles[L]
+    body_cur = c0.body
+    rngN_cur = c0.rng / atr_cur
+    bodyN_cur = abs(body_cur) / atr_cur
+    wickN_cur = (c0.upper_wick + c0.lower_wick) / atr_cur
 
-    # conflict / bounce (section 17): how balanced the two sides are.
-    conflict = (2.0 * min(buyer_force, seller_force)) / total
-    total_energy = buyer_force + seller_force
+    # ----- velocity / trend (section 2 & 5) -----
+    disp = c0.close - candles[L - W].close
+    normVel = (disp / W) / atr_cur
+    trendDir = _sign(normVel)
 
-    # ----- section 5: velocity established? (acceleration in winner's dir) -----
-    def dir_vel(cs: List[Candle]) -> float:
-        if not cs:
-            return 0.0
-        return sum(max(c.body * winner, 0.0) for c in cs) / (len(cs) * atr_v)
+    # ----- micro-war: netForce = sum(body/atr, warWin) with per-bar atr -----
+    netForce = sum(candles[L - k].body / atrs[L - k] for k in range(W))
+    netDir = _sign(netForce)
 
-    recent_k = min(3, W)
-    recent_vel = dir_vel(window[-recent_k:])
-    window_vel = dir_vel(window)
-    velocity_established = winner != 0 and recent_vel >= max(0.12, 0.9 * window_vel)
-    war_resolved = abs(dominance) >= cfg.dominance_threshold and velocity_established
+    # battles / conflict density (adjacent colour flips inside the window)
+    battles = 0
+    for k in range(W - 1):
+        s1 = _sign(candles[L - k].body)
+        s2 = _sign(candles[L - k - 1].body)
+        if s1 != s2 and s1 != 0 and s2 != 0:
+            battles += 1
+    conflictDensity = battles / float(W - 1) if W > 1 else 0.0
 
-    # ----- section 6 & 8: passion point + passion score -----
-    # per-candle passion emphasises resistance/holding (wicks) and range, not
-    # just body, so a smaller but contested candle can out-score a big empty one.
-    def passion_raw(c: Candle) -> float:
-        rejection = (c.upper_wick + c.lower_wick) / atr_v
-        return 0.6 * (c.abs_body / atr_v) + 0.5 * (c.rng / atr_v) + 0.7 * rejection
+    # up/down velocity (for the bouncing/energy read + display)
+    upVel = sum(max(candles[L - k].close - candles[L - k - 1].close, 0.0) for k in range(W)) / atr_cur
+    dnVel = sum(max(candles[L - k - 1].close - candles[L - k].close, 0.0) for k in range(W)) / atr_cur
 
-    passion_idx = max(range(W), key=lambda i: passion_raw(window[i]))
-    p_candle = window[passion_idx]
-    elongation = p_candle.rng / norm_rng
+    # ----- normal rate + elongation (section 9) -----
+    normalRate = sum(candles[i].rng / atrs[i] for i in range(L - cfg.normal_len + 1, L + 1)) / cfg.normal_len
+    elongation = rngN_cur / normalRate if normalRate > 0 else 1.0
 
-    # persistence (section 8): fraction of the window on the winner's side
-    persistence = sum(1 for c in window if c.direction == winner) / W if winner else 0.0
+    # ----- persistence (holdCount over the window, current atr) -----
+    holdCount = sum(1 for k in range(W) if (abs(candles[L - k].body) / atr_cur) < cfg.stub_body)
+    persistence = holdCount / float(W) if W > 0 else 0.0
 
-    # double taps / contradictory sub-moves (section 13): direction flips inside
-    # the window -> repeated structural activation / conflict density.
-    double_taps = sum(1 for i in range(1, W) if window[i].direction != window[i - 1].direction and window[i].direction != 0)
-
-    echo = read_echo(window, passion_idx, winner, atr_v, norm_body)
-
-    # passion is an *inferred state* from several observations (section 8):
-    # magnitude + persistence + repetition + defense + echo reinforcement.
-    rejection_norm = (p_candle.upper_wick + p_candle.lower_wick) / atr_v
-    passion_score = (
-        0.9 * (p_candle.abs_body / atr_v)
-        + 1.1 * persistence
-        + 0.35 * double_taps
-        + 0.8 * rejection_norm
-        + 0.6 * (echo.length)
-        + 0.5 * (1.0 if echo.reinforces_winner else 0.0)
-        - 0.4 * conflict
+    # ----- passion (section 6 & 8) -----
+    passion = (
+        cfg.w_mag * rngN_cur
+        + cfg.w_conf * (conflictDensity * 3)
+        + cfg.w_wick * wickN_cur
+        + cfg.w_pers * (persistence * 3)
     )
-    passion = _clip(_logistic(0.6 * passion_score - 1.4), 0.0, 1.0)
+
+    # ----- echo (section 7): replay the var-state over the series -----
+    echoDir = 0
+    echoLen: Optional[int] = None
+    echoMag: Optional[float] = None
+    lastBigBar: Optional[int] = None
+    for i in range(n):
+        rngN_i = candles[i].rng / atrs[i]
+        bodyN_i = abs(candles[i].body) / atrs[i]
+        if rngN_i > cfg.echo_trigger:
+            lastBigBar = i
+        if lastBigBar is not None:
+            respBar = i - lastBigBar
+            if 0 < respBar <= cfg.echo_max and bodyN_i > 0.05:
+                echoDir = _sign(candles[i].body)
+                echoLen = respBar
+                echoMag = rngN_i
+    echoPresent = echoLen is not None
+
+    # ----- war resolution + dominance (section 5 & 11) -----
+    warResolved = abs(normVel) >= cfg.trend_thresh and abs(netForce) >= cfg.dom_thresh and trendDir == netDir
+    winnerClear = warResolved or abs(netForce) >= cfg.dom_thresh
+    winnerDir = (trendDir if warResolved else netDir) if winnerClear else 0
+
+    # ----- trade decision: winner + echo agree -> LONG/SHORT, else wait -----
+    signalLong = winnerDir > 0 and echoDir > 0 and echoPresent
+    signalShort = winnerDir < 0 and echoDir < 0 and echoPresent
+    rawDir = 1 if signalLong else (-1 if signalShort else 0)
+
+    # ----- strength (drives SL/TP shaping in strategy.py) -----
+    echoRecency = max(0.0, (cfg.echo_max - echoLen) / float(cfg.echo_max)) if echoPresent else 0.0
+    echoMagN = min(1.0, echoMag / cfg.echo_trigger) if echoMag is not None else 0.0
+    echoStrength = (echoRecency + echoMagN) / 2.0
+    passionRel = min(2.0, passion / cfg.passion_thresh) if cfg.passion_thresh > 0 else 0.0
+    strength = _clip((passionRel / 2.0 + echoStrength) / 2.0, 0.0, 1.0)
+
+    echo = Echo(
+        direction=echoDir,
+        length=echoLen if echoLen is not None else 0,
+        latency=echoLen if echoLen is not None else 0,
+        magnitude=echoMag if echoMag is not None else 0.0,
+        micro_count=0,
+        reinforces_winner=(echoDir == winnerDir and winnerDir != 0),
+    )
 
     read = MarketRead(
-        symbol=symbol, price=price, atr=atr_v, normal_body=norm_body,
-        buyer_force=buyer_force, seller_force=seller_force, dominance=dominance,
-        winner=winner, war_resolved=war_resolved, velocity_established=velocity_established,
-        conflict=conflict, total_energy=total_energy, passion=passion,
-        passion_idx=passion_idx, elongation=elongation, double_taps=double_taps,
-        persistence=persistence, echo=echo,
+        symbol=symbol, price=price, atr=atr_cur, normal_body=normalRate,
+        buyer_force=upVel, seller_force=dnVel, dominance=netForce, winner=winnerDir,
+        war_resolved=warResolved, velocity_established=abs(normVel) >= cfg.trend_thresh,
+        conflict=conflictDensity, total_energy=upVel + dnVel, passion=passion,
+        passion_idx=0, elongation=elongation, double_taps=battles, persistence=persistence,
+        echo=echo, conviction=strength,
     )
 
-    _decide(read, cfg)
+    # verdict + reason (mirrors the indicator's curSignal wording)
+    if winnerDir == 0:
+        read.signal, read.reason = NO_TRADE, f"wait (no clear winner) |netForce|={abs(netForce):.2f}<{cfg.dom_thresh}"
+    elif not echoPresent:
+        read.signal, read.reason = NO_TRADE, "wait (no echo yet)"
+    elif rawDir == 0:
+        read.signal, read.reason = NO_TRADE, f"wait (echo disagrees) winner={winnerDir:+d} echo={echoDir:+d}"
+    else:
+        read.signal = LONG if rawDir > 0 else SHORT
+        label = "persistence (buyers)" if netDir > 0 else "exhaustion (sellers)"
+        read.reason = (
+            f"{label}: netForce={netForce:+.2f} normVel={normVel:+.3f} "
+            f"passion={passion:.2f} echo(dir={echoDir:+d},len={echo.length}) "
+            f"strength={strength:.2f}"
+        )
     return read
-
-
-# ---------------------------------------------------------------------------
-# section 5 & narrative rule: "winner + echo direction and length determines
-# short or long. if unclear or blank -> no trade till more context arrives."
-# ---------------------------------------------------------------------------
-def _decide(r: MarketRead, cfg) -> None:
-    if r.winner == 0:
-        r.signal, r.reason = NO_TRADE, "no winner (flat)"
-        return
-    if not r.war_resolved:
-        r.signal, r.reason = NO_TRADE, f"war unresolved (|dom|={abs(r.dominance):.2f}, vel_est={r.velocity_established})"
-        return
-    # section 17: both sides high velocity -> high bouncing, no lasting dominance
-    if r.conflict >= cfg.conflict_ceiling:
-        r.signal, r.reason = NO_TRADE, f"high bouncing (conflict={r.conflict:.2f})"
-        return
-    # echo must confirm the winner with enough length
-    if not r.echo.reinforces_winner:
-        r.signal, r.reason = NO_TRADE, "echo does not reinforce winner"
-        return
-    if r.echo.length < cfg.echo_min_len:
-        r.signal, r.reason = NO_TRADE, f"echo too short (len={r.echo.length} < {cfg.echo_min_len})"
-        return
-    if r.passion < cfg.passion_min:
-        r.signal, r.reason = NO_TRADE, f"passion below floor ({r.passion:.2f})"
-        return
-
-    # conviction blends passion, echo length/magnitude, and dominance (section 8).
-    # john's SL/TP rule: "passion point being the guiding principle ... higher
-    # passion + more explicit echo = lower SL and higher TP." so passion leads
-    # the blend (0.45) and the echo is the next strongest input (0.30 combined),
-    # with dominance (0.25) as support -- passion + echo drive the SL/TP shaping.
-    echo_len_norm = _clip(r.echo.length / max(cfg.war_window - 1, 1), 0.0, 1.0)
-    conviction = _clip(
-        0.45 * r.passion
-        + 0.20 * echo_len_norm
-        + 0.10 * _clip(r.echo.magnitude / 3.0, 0.0, 1.0)
-        + 0.25 * abs(r.dominance),
-        0.0, 1.0,
-    )
-    r.conviction = conviction
-    r.signal = LONG if r.winner > 0 else SHORT
-    label = "persistence(up)" if r.winner > 0 else "exhaustion(down)"  # section 11
-    r.reason = (
-        f"{label}: dom={r.dominance:+.2f} passion={r.passion:.2f} "
-        f"echo(dir={r.echo.direction:+d},len={r.echo.length},lat={r.echo.latency}) "
-        f"conviction={conviction:.2f}"
-    )
