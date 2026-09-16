@@ -275,13 +275,17 @@ def _decide(r: MarketRead, cfg) -> None:
         r.signal, r.reason = NO_TRADE, f"passion below floor ({r.passion:.2f})"
         return
 
-    # conviction blends dominance, passion, echo length/magnitude (section 8).
+    # conviction blends passion, echo length/magnitude, and dominance (section 8).
+    # john's SL/TP rule: "passion point being the guiding principle ... higher
+    # passion + more explicit echo = lower SL and higher TP." so passion leads
+    # the blend (0.45) and the echo is the next strongest input (0.30 combined),
+    # with dominance (0.25) as support -- passion + echo drive the SL/TP shaping.
     echo_len_norm = _clip(r.echo.length / max(cfg.war_window - 1, 1), 0.0, 1.0)
     conviction = _clip(
-        0.35 * abs(r.dominance)
-        + 0.35 * r.passion
+        0.45 * r.passion
         + 0.20 * echo_len_norm
-        + 0.10 * _clip(r.echo.magnitude / 3.0, 0.0, 1.0),
+        + 0.10 * _clip(r.echo.magnitude / 3.0, 0.0, 1.0)
+        + 0.25 * abs(r.dominance),
         0.0, 1.0,
     )
     r.conviction = conviction

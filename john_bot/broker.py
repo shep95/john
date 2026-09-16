@@ -128,6 +128,17 @@ class PaperBroker:
         self.pos = None
         return closed
 
+    def restore_position(self, d: dict) -> None:
+        """rebuild an open position persisted before a restart so settling can
+        resume where it left off (paper equity itself resets to PAPER_EQUITY)."""
+        self.pos = Position(
+            symbol=d["symbol"], side=d["side"], is_buy=bool(d["is_buy"]),
+            size=float(d["size"]), entry=float(d["entry"]),
+            stop_loss=float(d["stop_loss"]), take_profit=float(d["take_profit"]),
+            opened_at=float(d["opened_at"]),
+        )
+        log.info("[paper] restored open %s %s from state", d["symbol"], d["side"])
+
 
 # ---------------------------------------------------------------------------
 class LiveBroker:
@@ -229,17 +240,128 @@ class LiveBroker:
             return None  # still open, exchange manages TP/SL
 
         opened_at, plan = self._open_meta.pop(symbol)
-        exit_px = self.market.last_price(symbol, self.cfg.interval)
-        # infer reason by which level is closer to the exit
+        # use the real closing fills for the true exit price + realized pnl,
+        # not the current mark (which drifts from the actual trigger fill).
+        exit_px, pnl, closed_at = self._closing_fill_summary(symbol, plan, opened_at)
+        # which trigger fired: the level the fill price landed nearest to.
         reason = "TP" if abs(exit_px - plan.take_profit) <= abs(exit_px - plan.stop_loss) else "SL"
-        direction = 1 if plan.is_buy else -1
-        pnl = (exit_px - plan.entry_ref) * plan.size * direction
         closed = ClosedTrade(symbol, plan.side, plan.entry_ref, exit_px, plan.size, pnl,
-                             reason, opened_at, time.time())
-        log.info("[live] CLOSE %s %s exit=%.6g ~pnl=%.4f dur=%.0fs",
+                             reason, opened_at, closed_at)
+        log.info("[live] CLOSE %s %s exit=%.6g pnl=%.4f dur=%.0fs",
                  symbol, reason, exit_px, pnl, closed.duration_sec)
         self._cancel_triggers(symbol)
         return closed
+
+    def _closing_fill_summary(self, symbol: str, plan: TradePlan, opened_at: float):
+        """(exit_px, realized_pnl, closed_at) from real exchange fills since the
+        position opened. sums the closing fills' realized pnl (net of fees) and
+        takes the last fill's price/time. falls back to the mark if fills are
+        unavailable, so a settle never silently fails."""
+        opened_ms = int(opened_at * 1000)
+        exit_px: Optional[float] = None
+        realized = 0.0
+        last_ms: Optional[int] = None
+        got = False
+        try:
+            for f in self.info.user_fills(self.address):
+                if f.get("coin", "").upper() != symbol.upper():
+                    continue
+                t_ms = int(f.get("time", 0))
+                if t_ms < opened_ms:
+                    continue
+                # closing fills carry a non-zero closedPnl; opening fills are 0.
+                cpnl = float(f.get("closedPnl", 0.0) or 0.0)
+                if cpnl == 0.0:
+                    continue
+                realized += cpnl - float(f.get("fee", 0.0) or 0.0)
+                if last_ms is None or t_ms >= last_ms:
+                    last_ms, exit_px = t_ms, float(f.get("px", 0.0) or 0.0)
+                got = True
+        except Exception as e:
+            log.warning("[live] user_fills read failed, approximating exit: %s", e)
+
+        if not got or not exit_px:
+            exit_px = self.market.last_price(symbol, self.cfg.interval)
+            direction = 1 if plan.is_buy else -1
+            realized = (exit_px - plan.entry_ref) * plan.size * direction
+            return exit_px, realized, time.time()
+        return exit_px, realized, (last_ms / 1000.0 if last_ms else time.time())
+
+    # -- restart recovery ----------------------------------------------------
+    def _plan_from_dict(self, d: dict) -> TradePlan:
+        entry, size = float(d["entry"]), float(d["size"])
+        sl, tp = float(d["stop_loss"]), float(d["take_profit"])
+        sl_dist, tp_dist = abs(entry - sl), abs(tp - entry)
+        return TradePlan(
+            symbol=d["symbol"], side=d["side"], is_buy=bool(d["is_buy"]),
+            entry_ref=entry, stop_loss=sl, take_profit=tp, size=size,
+            notional=size * entry, conviction=float(d.get("conviction", 0.0)),
+            sl_dist=sl_dist, tp_dist=tp_dist,
+            rr=(tp_dist / sl_dist if sl_dist > 0 else 0.0), reason="resumed",
+        )
+
+    def restore_position(self, d: dict) -> None:
+        """re-adopt a position persisted before a restart so the bot keeps
+        tracking it (and does not open a second one)."""
+        sym = d["symbol"]
+        self._open_meta[sym] = (float(d["opened_at"]), self._plan_from_dict(d))
+        self._leverage_set.add(sym)
+        log.info("[live] restored open %s %s from state", sym, d["side"])
+
+    def _trigger_levels(self, symbol: str, is_buy: bool, entry: float):
+        """best-effort recovery of SL/TP from the resting reduce-only trigger
+        orders on the exchange. long: TP above entry, SL below; short: reversed.
+        returns (sl, tp), defaulting to entry when a level cannot be read."""
+        sl = tp = entry
+        try:
+            for o in self.info.open_orders(self.address):
+                if o.get("coin", "").upper() != symbol.upper():
+                    continue
+                raw = o.get("triggerPx")
+                if raw is None:
+                    raw = (o.get("trigger") or {}).get("triggerPx")
+                if raw is None:
+                    continue
+                trig = float(raw)
+                # a trigger above entry is the TP for a long / the SL for a short.
+                if (trig >= entry) == is_buy:
+                    tp = trig
+                else:
+                    sl = trig
+        except Exception:
+            pass
+        return sl, tp
+
+    def sync_from_exchange(self) -> None:
+        """adopt any live position the exchange still holds that we are not
+        tracking -- e.g. state.json was lost or the bot restarted before it
+        persisted. the on-exchange reduce-only TP/SL triggers keep protecting the
+        position regardless; this just makes the bot aware of it so it will not
+        open a second position and will settle + record this one when it closes."""
+        for sym in self.cfg.symbols:
+            if sym in self._open_meta:
+                continue
+            try:
+                pos, szi = self._raw_position(sym)
+            except Exception:
+                continue
+            if abs(szi) <= 0:
+                continue
+            entry = float(pos.get("entryPx", 0.0) or 0.0)
+            is_buy = szi > 0
+            sl, tp = self._trigger_levels(sym, is_buy, entry)
+            d = {
+                "symbol": sym, "side": "LONG" if is_buy else "SHORT", "is_buy": is_buy,
+                "size": abs(szi), "entry": entry, "stop_loss": sl, "take_profit": tp,
+                "opened_at": time.time(),
+            }
+            self._open_meta[sym] = (d["opened_at"], self._plan_from_dict(d))
+            self._leverage_set.add(sym)
+            log.warning(
+                "[live] adopted untracked %s position from exchange (size=%.6g "
+                "entry=%.6g sl=%.6g tp=%.6g) -- opened_at approximated to now",
+                sym, abs(szi), entry, sl, tp,
+            )
 
     def _cancel_triggers(self, symbol: str) -> None:
         try:
