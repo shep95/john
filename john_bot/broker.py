@@ -161,12 +161,50 @@ class LiveBroker:
                  self.address[:6], self.address[-4:], cfg.testnet)
 
     def equity(self) -> float:
+        """usable account value in USDC. classic perps report it under
+        marginSummary.accountValue, but a *unified* account (spot USDC backing
+        perps) leaves that at 0 and exposes the balance elsewhere -- so we fall
+        back through crossMarginSummary and the top-level withdrawable, and read
+        the spot USDC balance as a last resort. logs the raw fields when it can
+        only find 0 so the right source is visible."""
         try:
             st = self.info.user_state(self.address)
-            return float(st["marginSummary"]["accountValue"])
         except Exception as e:
             log.warning("[live] equity read failed: %s", e)
-            return self.cfg.paper_equity
+            return 0.0  # never size off a fake balance in live mode
+
+        ms = st.get("marginSummary", {}) or {}
+        cms = st.get("crossMarginSummary", {}) or {}
+        for src, v in (
+            ("marginSummary.accountValue", ms.get("accountValue")),
+            ("crossMarginSummary.accountValue", cms.get("accountValue")),
+            ("withdrawable", st.get("withdrawable")),
+        ):
+            try:
+                fv = float(v)
+            except (TypeError, ValueError):
+                continue
+            if fv > 0:
+                return fv
+
+        # unified/spot-collateral fallback: sum spot USDC
+        try:
+            sp = self.info.spot_user_state(self.address)
+            for b in sp.get("balances", []):
+                if str(b.get("coin", "")).upper() == "USDC":
+                    fv = float(b.get("total", 0.0) or 0.0)
+                    if fv > 0:
+                        log.info("[live] equity from spot USDC balance = %.4f", fv)
+                        return fv
+        except Exception as e:
+            log.warning("[live] spot_user_state read failed: %s", e)
+
+        log.warning(
+            "[live] equity resolved to 0 -- raw marginSummary=%s crossMarginSummary=%s "
+            "withdrawable=%s (share USDC to the perps/unified account)",
+            ms, cms, st.get("withdrawable"),
+        )
+        return 0.0
 
     def _raw_position(self, symbol: str):
         st = self.info.user_state(self.address)
