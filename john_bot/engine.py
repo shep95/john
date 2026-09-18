@@ -178,8 +178,11 @@ class Engine:
         self._run_reflection()
 
     def _run_reflection(self) -> None:
-        """after each trade: review the whole history, and if the reflection
-        clears the guardrails, adopt a new self-learned entry filter."""
+        """runs automatically after every closed trade. it re-derives its rule
+        from the LATEST full history each time and REPLACES the learned set --
+        so it self-corrects both ways: it adopts a rule when the data supports
+        one, changes the threshold as data grows, and drops the rule on its own
+        when the data no longer justifies it. no manual step is ever involved."""
         try:
             r = reflect(self.state.trades, self.cfg)
         except Exception as e:
@@ -187,21 +190,37 @@ class Engine:
             return
         self._last_reflection = r
         self.log.info("[reflect] %s", r.summary)
-        if not self.cfg.self_learn or r.proposal is None:
+        if not self.cfg.self_learn:
             return
-        p = r.proposal
-        prev = self.state.learned.get(p.key)
-        self.state.learned[p.key] = p.threshold
+
+        old = dict(self.state.learned)
+        new = {r.proposal.key: r.proposal.threshold} if r.proposal else {}
+        if new == old:
+            return  # nothing changed this cycle
+
+        self.state.learned = new
         save_state(self.cfg.state_path, self.state)
-        self.log.info("[reflect] ADOPTED rule: %s (was %s)", p.human(), prev)
+
+        # describe what it changed, on its own
+        if r.proposal is None:
+            change = f"dropped rule ({', '.join(old)}) — no longer justified by the data"
+            title, rule_line = "🧠 john relaxed a rule", "back to base rules"
+        elif not old:
+            change = f"adopted: {r.proposal.human()}"
+            title, rule_line = "🧠 john tuned itself", r.proposal.human()
+        else:
+            change = f"changed rule: {', '.join(old)} → {r.proposal.human()}"
+            title, rule_line = "🧠 john re-tuned itself", r.proposal.human()
+        self.log.info("[reflect] AUTO %s", change)
         fields = [
             ("reviewed", f"{r.n} trades", True),
-            ("win rate", f"{r.winrate:.0f}% → {p.new_winrate:.0f}%", True),
-            ("expectancy", f"{r.expectancy:+.2f}R → {p.new_exp:+.2f}R", True),
-            ("new rule", p.human(), False),
+            ("win rate", f"{r.winrate:.0f}%", True),
+            ("expectancy", f"{r.expectancy:+.2f}R", True),
+            ("change", change, False),
+            ("active rule", rule_line, False),
             ("its critique", r.worst_pattern, False),
         ]
-        self.notifier.send_embed("🧠 john tuned itself", fields, BLUE, ping=False)
+        self.notifier.send_embed(title, fields, BLUE, ping=False)
 
     def _settle_open(self) -> None:
         pos = self.broker.any_position()
