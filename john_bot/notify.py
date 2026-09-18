@@ -231,6 +231,23 @@ class BotNotifier:
             e.add_field(name="cooldown", value=cfg.cooldown_mode, inline=True)
             await interaction.response.send_message(embed=e)
 
+        @bot.tree.command(name="reflect", description="john's self-review: errors + any rules it learned")
+        async def reflect_cmd(interaction: discord.Interaction):
+            r = engine.reflection_report()
+            e = discord.Embed(title="🧠 self-review", color=BLUE)
+            e.add_field(name="trades", value=str(r["n"]), inline=True)
+            e.add_field(name="win rate", value=f"{r['winrate']:.0f}%", inline=True)
+            e.add_field(name="expectancy", value=f"{r['expectancy']:+.2f}R", inline=True)
+            e.add_field(name="its critique", value=r["critique"], inline=False)
+            learned = r["learned"]
+            e.add_field(name="rules it learned",
+                        value=("\n".join(f"• {k} = {v}" for k, v in learned.items()) if learned else "none yet"),
+                        inline=False)
+            if r["proposal"]:
+                e.add_field(name="considering", value=r["proposal"], inline=False)
+            e.add_field(name="summary", value=r["summary"], inline=False)
+            await interaction.response.send_message(embed=e)
+
         try:
             bot.run(cfg.discord_bot_token, log_handler=None)
         except Exception as e:

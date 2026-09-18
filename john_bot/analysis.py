@@ -99,7 +99,7 @@ class MarketRead:
     reason: str = ""
 
 
-def analyze(symbol: str, candles: List[Candle], cfg) -> MarketRead:
+def analyze(symbol: str, candles: List[Candle], cfg, learned: Optional[dict] = None) -> MarketRead:
     """port of asherin.pine's per-bar read, evaluated on the latest closed bar."""
     n = len(candles)
     price = candles[-1].close if candles else 0.0
@@ -234,4 +234,21 @@ def analyze(symbol: str, candles: List[Candle], cfg) -> MarketRead:
             f"passion={passion:.2f} echo(dir={echoDir:+d},len={echo.length}) "
             f"strength={strength:.2f}"
         )
+
+    # self-learned filters (from reflect.py). they ONLY veto a trade the base
+    # rules would have taken -- they can never create or loosen one.
+    if read.signal in (LONG, SHORT) and learned:
+        ms = learned.get("min_strength")
+        mc = learned.get("max_conflict")
+        mf = learned.get("min_abs_net_force")
+        me = learned.get("min_echo_len")
+        if ms is not None and strength < ms:
+            read.signal, read.reason = NO_TRADE, f"learned veto: strength {strength:.2f} < {ms:.2f}"
+        elif mc is not None and conflictDensity > mc:
+            read.signal, read.reason = NO_TRADE, f"learned veto: conflict {conflictDensity:.2f} > {mc:.2f}"
+        elif mf is not None and abs(netForce) < mf:
+            read.signal, read.reason = NO_TRADE, f"learned veto: |netForce| {abs(netForce):.2f} < {mf:.2f}"
+        elif me is not None and echo.length < me:
+            read.signal, read.reason = NO_TRADE, f"learned veto: echo len {echo.length} < {int(me)}"
+
     return read

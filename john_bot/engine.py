@@ -23,7 +23,8 @@ from .broker import ClosedTrade, make_broker
 from .config import CONFIG, Config
 from .logutil import get_logger
 from .market import Candle, MarketData
-from .notify import GREEN, RED, money, make_notifier
+from .notify import BLUE, GREEN, RED, money, make_notifier
+from .reflect import reflect
 from .state import BotState, TradeRecord, load_state, save_state
 from .strategy import TradePlan, build_plan
 
@@ -38,6 +39,7 @@ class Engine:
         self._sz_dec: dict = {}
         self._lock = threading.Lock()
         self._flatten_req = False
+        self._last_reflection = None
         if not cfg.symbols:
             raise ValueError("no symbols configured")
         self.state.rotation_idx %= len(cfg.symbols)
@@ -75,6 +77,7 @@ class Engine:
         self.state.start_base = 0.0
         self.state.last_trade_duration = 0.0
         self.state.trades = []
+        self.state.learned = {}   # forget self-learned rules on a fresh scoreboard
         self.state.reset_id = self.cfg.reset_id
         save_state(self.cfg.state_path, self.state)
 
@@ -149,11 +152,16 @@ class Engine:
         return compounded, banked
 
     def _finish_trade(self, closed: ClosedTrade) -> None:
+        # pull the entry-time read features (stashed at open) for reflection
+        feats = (self.state.open_position or {}).get("features", {}) if self.state.open_position else {}
         self.state.open_position = None  # flat again -> nothing to resume on restart
         self.state.record(TradeRecord(
             symbol=closed.symbol, side=closed.side, entry=closed.entry, exit=closed.exit,
             pnl=closed.pnl, reason=closed.reason, opened_at=closed.opened_at,
             closed_at=closed.closed_at, duration_sec=closed.duration_sec,
+            strength=float(feats.get("strength", 0.0)), net_force=float(feats.get("net_force", 0.0)),
+            passion=float(feats.get("passion", 0.0)), conflict=float(feats.get("conflict", 0.0)),
+            echo_len=int(feats.get("echo_len", 0)), rr=float(feats.get("rr", 0.0)),
         ))
         compounded, banked = self._apply_compounding(closed.pnl)
         cd = self._cooldown_from(closed)
@@ -167,6 +175,33 @@ class Engine:
         )
         self._alert_exit(closed, compounded, banked, cd)
         save_state(self.cfg.state_path, self.state)
+        self._run_reflection()
+
+    def _run_reflection(self) -> None:
+        """after each trade: review the whole history, and if the reflection
+        clears the guardrails, adopt a new self-learned entry filter."""
+        try:
+            r = reflect(self.state.trades, self.cfg)
+        except Exception as e:
+            self.log.warning("reflection failed: %s", e)
+            return
+        self._last_reflection = r
+        self.log.info("[reflect] %s", r.summary)
+        if not self.cfg.self_learn or r.proposal is None:
+            return
+        p = r.proposal
+        prev = self.state.learned.get(p.key)
+        self.state.learned[p.key] = p.threshold
+        save_state(self.cfg.state_path, self.state)
+        self.log.info("[reflect] ADOPTED rule: %s (was %s)", p.human(), prev)
+        fields = [
+            ("reviewed", f"{r.n} trades", True),
+            ("win rate", f"{r.winrate:.0f}% → {p.new_winrate:.0f}%", True),
+            ("expectancy", f"{r.expectancy:+.2f}R → {p.new_exp:+.2f}R", True),
+            ("new rule", p.human(), False),
+            ("its critique", r.worst_pattern, False),
+        ]
+        self.notifier.send_embed("🧠 john tuned itself", fields, BLUE, ping=False)
 
     def _settle_open(self) -> None:
         pos = self.broker.any_position()
@@ -207,7 +242,7 @@ class Engine:
             self.log.info("waiting for candles on %s (%d)", symbol, len(candles))
             return
 
-        read = analyze(symbol, candles, self.cfg)
+        read = analyze(symbol, candles, self.cfg, self.state.learned)
         if read.signal == NO_TRADE:
             self.log.info("%s no-trade: %s", symbol, read.reason)
             return
@@ -226,7 +261,14 @@ class Engine:
             pos = self.broker.any_position()
             # persist the open trade so a restart resumes it instead of
             # double-opening on the rotated symbol
-            self.state.open_position = self._position_dict(pos) if pos else None
+            d = self._position_dict(pos) if pos else {}
+            # stash the entry-time read so the reflection loop can learn from it
+            d["features"] = {
+                "strength": read.conviction, "net_force": read.dominance,
+                "passion": read.passion, "conflict": read.conflict,
+                "echo_len": read.echo.length, "rr": plan.rr,
+            }
+            self.state.open_position = d or None
             self._alert_entry(plan)
             save_state(self.cfg.state_path, self.state)
 
@@ -308,6 +350,17 @@ class Engine:
                 "roi": roi,
                 "cooldown_remaining": max(0.0, s.cooldown_until - time.time()),
             }
+
+    def reflection_report(self) -> dict:
+        """compute the current self-review on demand (for the /reflect command)."""
+        r = reflect(self.state.trades, self.cfg)
+        return {
+            "n": r.n, "winrate": r.winrate, "expectancy": r.expectancy,
+            "wins": r.wins, "losses": r.losses, "summary": r.summary,
+            "critique": r.worst_pattern,
+            "learned": dict(self.state.learned),
+            "proposal": r.proposal.human() if r.proposal else None,
+        }
 
     def position_report(self) -> Optional[dict]:
         pos = self.broker.any_position()

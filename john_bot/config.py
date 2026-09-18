@@ -136,6 +136,15 @@ class Config:
     # pnl / win-rate / compounding once. leave it the same to keep history.
     reset_id: str = field(default_factory=lambda: _s("RESET_ID", ""))
 
+    # --- self-reflection / self-improvement (reflect.py) ---
+    # after each closed trade, once there are >= min_trades_to_learn trades, the
+    # bot reviews its own history and may adopt a new entry filter (only ever
+    # making entries pickier). set SELF_LEARN=false to keep it report-only.
+    self_learn: bool = field(default_factory=lambda: _b("SELF_LEARN", True))
+    min_trades_to_learn: int = field(default_factory=lambda: _i("MIN_TRADES_TO_LEARN", 20))
+    learn_margin: float = field(default_factory=lambda: _f("LEARN_MARGIN", 0.20))  # min R gain to adopt
+    learn_keep_frac: float = field(default_factory=lambda: _f("LEARN_KEEP_FRAC", 0.5))
+
     @property
     def is_live(self) -> bool:
         return (not self.dry_run) and bool(self.private_key)

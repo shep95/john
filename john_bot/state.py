@@ -21,6 +21,13 @@ class TradeRecord:
     opened_at: float
     closed_at: float
     duration_sec: float
+    # entry-time read features, kept so the bot can reflect on WHY it won/lost
+    strength: float = 0.0
+    net_force: float = 0.0
+    passion: float = 0.0
+    conflict: float = 0.0
+    echo_len: int = 0
+    rr: float = 0.0
 
 
 @dataclass
@@ -38,6 +45,9 @@ class BotState:
     start_base: float = 0.0         # first sizing_base, for roi
     paused: bool = False
     reset_id: str = ""              # matches cfg.reset_id; a mismatch wipes stats
+    # self-learned entry filters adopted by the reflection loop (reflect.py).
+    # only ever tighten entries; wiped on a RESET_ID change.
+    learned: dict = field(default_factory=dict)
     # the currently-open trade, persisted so a restart (railway redeploy) does
     # not lose track of a live position. None when flat. keys mirror the fields
     # a broker needs to resume settling: symbol, side, is_buy, size, entry,
