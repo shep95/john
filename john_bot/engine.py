@@ -42,6 +42,9 @@ class Engine:
             raise ValueError("no symbols configured")
         self.state.rotation_idx %= len(cfg.symbols)
 
+        # scoreboard reset: if RESET_ID changed, wipe pnl / win-rate / compounding
+        self._maybe_reset_stats()
+
         # initialise the compounding sizing base on first run
         if self.state.sizing_base <= 0:
             base = self.broker.equity()
@@ -54,6 +57,26 @@ class Engine:
         # discord (bot with commands, or webhook alerts, or silent)
         self.notifier = make_notifier(cfg, self)
         self.notifier.start()
+
+    def _maybe_reset_stats(self) -> None:
+        """wipe the scoreboard (pnl, win/loss, compounding, trade history) when
+        the RESET_ID env var differs from what's stored -- so changing RESET_ID
+        and redeploying gives a clean track record exactly once. an open live
+        position and the rotation are left untouched."""
+        if self.cfg.reset_id == self.state.reset_id:
+            return
+        self.log.info("resetting scoreboard (reset_id %r -> %r)",
+                      self.state.reset_id, self.cfg.reset_id)
+        self.state.realized_pnl = 0.0
+        self.state.wins = 0
+        self.state.losses = 0
+        self.state.banked_reserve = 0.0
+        self.state.sizing_base = 0.0   # re-initialised from equity below
+        self.state.start_base = 0.0
+        self.state.last_trade_duration = 0.0
+        self.state.trades = []
+        self.state.reset_id = self.cfg.reset_id
+        save_state(self.cfg.state_path, self.state)
 
     def _restore_open_position(self) -> None:
         """after a restart (railway redeploy), re-adopt the open position so the
@@ -211,17 +234,23 @@ class Engine:
     def _alert_entry(self, plan: TradePlan) -> None:
         est_profit = plan.tp_dist * plan.size
         est_loss = plan.sl_dist * plan.size
+        # money actually committed to the trade = margin = notional / leverage
+        margin = plan.notional / self.cfg.leverage if self.cfg.leverage else plan.notional
+        total = self.state.wins + self.state.losses
+        wr = (self.state.wins / total * 100) if total else 0.0
         arrow = "🟢 LONG" if plan.is_buy else "🔴 SHORT"
         fields = [
             ("symbol", f"{plan.symbol}  {self.cfg.leverage}x", True),
             ("side", arrow, True),
             ("conviction", f"{plan.conviction:.2f}", True),
             ("entry", f"{plan.entry_ref:.6g}", True),
+            ("amount entered", f"{money(margin)} margin", True),
             ("size / notional", f"{plan.size} ({money(plan.notional)})", True),
             ("reward : risk", f"{plan.rr:.2f} : 1", True),
             ("take profit", f"{plan.take_profit:.6g}  (+{money(est_profit)})", True),
             ("stop loss", f"{plan.stop_loss:.6g}  (-{money(est_loss)})", True),
             ("sizing base", money(self.state.sizing_base), True),
+            ("win rate", f"{wr:.0f}%  ({self.state.wins}W / {self.state.losses}L)", True),
             ("read", plan.reason, False),
         ]
         self.notifier.send_embed("📈 trade entered", fields, GREEN, ping=True)
@@ -243,7 +272,8 @@ class Engine:
             ("sizing base", money(self.state.sizing_base), True),
             ("realized pnl", money(self.state.realized_pnl), True),
             ("banked total", money(self.state.banked_reserve), True),
-            ("record", f"{self.state.wins}W / {self.state.losses}L  ({wr:.0f}%)", True),
+            ("win rate", f"{wr:.0f}%", True),
+            ("record", f"{self.state.wins}W / {self.state.losses}L  ({total} trades)", True),
         ]
         self.notifier.send_embed(f"{head} — {money(closed.pnl)}", fields,
                                  GREEN if won else RED, ping=True)

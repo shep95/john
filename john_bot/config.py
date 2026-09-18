@@ -132,6 +132,9 @@ class Config:
     # --- persistence ---
     state_path: str = field(default_factory=lambda: _s("STATE_PATH", "state.json"))
     log_level: str = field(default_factory=lambda: _s("LOG_LEVEL", "INFO"))
+    # scoreboard reset: change RESET_ID to any new value and redeploy to wipe
+    # pnl / win-rate / compounding once. leave it the same to keep history.
+    reset_id: str = field(default_factory=lambda: _s("RESET_ID", ""))
 
     @property
     def is_live(self) -> bool:

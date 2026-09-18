@@ -37,6 +37,7 @@ class BotState:
     banked_reserve: float = 0.0     # profit set aside (the 60% not compounded)
     start_base: float = 0.0         # first sizing_base, for roi
     paused: bool = False
+    reset_id: str = ""              # matches cfg.reset_id; a mismatch wipes stats
     # the currently-open trade, persisted so a restart (railway redeploy) does
     # not lose track of a live position. None when flat. keys mirror the fields
     # a broker needs to resume settling: symbol, side, is_buy, size, entry,
