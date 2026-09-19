@@ -14,19 +14,20 @@ deterministic math and traded live on hyperliquid.
 ![deploy](https://img.shields.io/badge/deploy-railway-0b0f19?style=for-the-badge&logo=railway&logoColor=7cf5c4&labelColor=0b0f19)
 <br>
 ![engine](https://img.shields.io/badge/engine-deterministic-7cf5c4?style=for-the-badge&labelColor=0b0f19)
-![leverage](https://img.shields.io/badge/leverage-5x_isolated-7cf5c4?style=for-the-badge&labelColor=0b0f19)
+![leverage](https://img.shields.io/badge/leverage-2x_isolated-7cf5c4?style=for-the-badge&labelColor=0b0f19)
 ![default](https://img.shields.io/badge/default-paper_safe-ff5f8f?style=for-the-badge&labelColor=0b0f19)
 
-`5m + 1h charts` · `ETH ⇄ DOGE rotation` · `no model · no runtime learning`
+`5m + 1h charts` · `KAS` · `deterministic` · `self-review` · `no model, no runtime learning`
 
 </div>
 
 ---
 
 > [!NOTE]
-> there is no ai here. every decision is deterministic math over the last N
-> closed candles — exactly the primitives john described. nothing is fit,
-> trained, or learned at runtime.
+> there is no ai model here. every trade decision is deterministic math over the
+> last N closed candles — exactly the primitives john described. an **optional**
+> self-review layer (off by default, `SELF_LEARN`) can tighten its own entry
+> filters after enough trades, but the core signal is never a trained model.
 
 <br>
 
@@ -83,12 +84,14 @@ each closed 5m frame is compiled through seven stages. the unit is the
 
 | trait | rule |
 | --- | --- |
-| **cadence** | 5m chart · one position at a time |
-| **rotation** | after every close, flip active symbol `ETH → DOGE → ETH …` |
-| **cooldown** | equals the *last trade's* duration — a 40m trade → ~40m wait (clamped `MIN/MAX_COOLDOWN_SEC`) |
+| **market** | trades **`KAS`** by default (any Hyperliquid perp; set `SYMBOLS`) · one position at a time |
+| **cadence** | 5m chart · new entries only inside the trading-hours window (`SESSION_START/END_HOUR`, 08–20 UTC) |
+| **cooldown** | equals the *last trade's* duration — a 40m trade → ~40m wait (clamped `MIN/MAX_COOLDOWN_SEC`, min 30m) |
 | **exits** | live places **reduce-only trigger orders** on-exchange, so TP/SL fire even if the bot is down |
-| **leverage** | 5x isolated (configurable) |
-| **compounding** | **40%** of each profit compounds into the sizing base, **60%** is banked; losses come out of the base, so wins grow position size |
+| **leverage** | **2x** isolated (configurable) |
+| **risk limits** | ≤20% notional per trade · **6% daily-loss circuit breaker** pauses new entries |
+| **compounding** | **40%** of each profit compounds into the sizing base, **60%** is banked (optional ceiling `MAX_SIZING_BASE`); losses come out of the base |
+| **self-review** | after ≥20 trades it can tighten its own entry filters (opt-in `SELF_LEARN`, alerts before adopting) |
 | **restart-safe** | the open trade is persisted and, in live mode, **reconciled directly from the exchange** on boot — no double-open, no lost position |
 
 <br>
@@ -102,19 +105,18 @@ the bot's rhythm is set by the trade you just took, not a fixed clock.
    entering a new one.
 
    > [!NOTE]
-   > **scenario.** you enter ETH and it takes **40 minutes** to hit take-profit.
-   > the bot now sits out for **~40 minutes** before it will consider the next
-   > entry. a trade that resolved in **8 minutes** → only an **~8 minute** wait.
-   > (clamped by `MIN_COOLDOWN_SEC` / `MAX_COOLDOWN_SEC`.)
+   > **scenario.** you enter KAS and it takes **40 minutes** to hit take-profit.
+   > the bot now sits out for **~40 minutes** (min 30m) before it will consider
+   > the next entry. a trade that resolved in **10 minutes** → the 30-minute
+   > floor applies. (clamped by `MIN_COOLDOWN_SEC` / `MAX_COOLDOWN_SEC`.)
 
 2. **timeframes: trade the 1-hour and the 5-minute charts only.** the 5m is the
    default reactive frame; the 1h is the slower, higher-conviction frame. set it
    with `INTERVAL=5m` or `INTERVAL=1h`.
 
-3. **don't want to wait out the cooldown? rotate to a different asset.** the
-   cooldown is per the symbol you just traded — switch the active market
-   (`ETH → DOGE`, or add more via `SYMBOLS`) and you can keep hunting setups
-   instead of sitting on your hands.
+3. **change the market with `SYMBOLS`.** it trades one symbol (`KAS` by default);
+   set `SYMBOLS=KAS` — or comma-separate (e.g. `SYMBOLS=KAS,DOGE`) to rotate
+   between markets after each closed trade.
 
 <br>
 
@@ -125,7 +127,7 @@ for instant command sync, `DISCORD_USER_ID` to get pinged):
 
 - 📈 **entry** — side, size, entry, TP/SL with estimated P&L, reward:risk, conviction.
 - ✅ / 🛑 **exit** — result, trade pnl, held time, compounded 40% vs banked 60%, new sizing base, realized pnl + W/L record.
-- ⌨️ **slash commands** — `/status` `/position` `/pnl` `/pause` `/resume` `/flatten` `/params`
+- ⌨️ **slash commands** — `/status` `/position` `/pnl` `/pause` `/resume` `/flatten` `/params` `/reflect`
 
 > [!TIP]
 > alerts-only, no commands? just set `DISCORD_WEBHOOK_URL` and skip the token.
@@ -150,8 +152,8 @@ for instant command sync, `DISCORD_USER_ID` to get pinged):
 pip install -r requirements.txt
 
 # backtest / self-test on real recent candles
-python -m john_bot.backtest            # ETH + DOGE, 500 candles
-python -m john_bot.backtest ETH 1000
+python -m john_bot.backtest            # configured symbols, 500 candles
+python -m john_bot.backtest KAS 1000
 
 # run the live loop in PAPER mode (simulated fills on live data)
 python -m john_bot
@@ -619,9 +621,11 @@ alertcondition(bouncing,                 "conflict",     "both sides high veloci
 
 > [!CAUTION]
 > trading perps with leverage can lose your entire margin. defaults are
-> conservative (paper on, 2% risk/trade, isolated 5x), but backtest results are
-> hypothetical, ignore funding and most slippage beyond a taker-fee estimate, and
-> guarantee nothing. **start on testnet or tiny size.**
+> conservative (paper on, 2% risk/trade, isolated 2x, ≤20% notional, 6% daily-loss
+> cap), but backtest results are hypothetical, ignore funding and most slippage
+> beyond a taker-fee estimate, and guarantee nothing. **start on testnet or tiny
+> size.** note: at 2x with ≤20% notional, a very small account (e.g. ~$20) may not
+> reach Hyperliquid's ~$10 minimum order — fund more or raise `MAX_POSITION_FRAC`.
 
 <div align="center">
 <br>

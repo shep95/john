@@ -57,7 +57,7 @@ class Config:
     # --- market / rotation ---
     symbols: List[str] = field(
         default_factory=lambda: [
-            s.strip().upper() for s in _s("SYMBOLS", "DOGE").split(",") if s.strip()
+            s.strip().upper() for s in _s("SYMBOLS", "KAS").split(",") if s.strip()
         ]
     )
     interval: str = field(default_factory=lambda: _s("INTERVAL", "5m"))
