@@ -26,10 +26,16 @@ def _won(t: dict) -> bool:
 
 
 def _r_multiple(t: dict) -> float:
-    """realized reward:risk. a win banks its planned rr; a loss is -1R."""
-    if _won(t):
+    """realized reward:risk based on ACTUAL pnl vs the $ risked at the stop --
+    so slippage/fees on wins and worse-than-planned stops on losses are counted
+    honestly. falls back to the idealised rr/-1 only when risk wasn't recorded."""
+    pnl = float(t.get("pnl", 0.0) or 0.0)
+    risk = float(t.get("risk_usd", 0.0) or 0.0)
+    if risk > 0:
+        return pnl / risk
+    if pnl > 0:
         return float(t.get("rr", 1.0) or 1.0)
-    if float(t.get("pnl", 0.0) or 0.0) < 0:
+    if pnl < 0:
         return -1.0
     return 0.0
 

@@ -28,6 +28,7 @@ class TradeRecord:
     conflict: float = 0.0
     echo_len: int = 0
     rr: float = 0.0
+    risk_usd: float = 0.0   # $ that would be lost at the stop, for real R-multiples
 
 
 @dataclass
@@ -48,6 +49,9 @@ class BotState:
     # self-learned entry filters adopted by the reflection loop (reflect.py).
     # only ever tighten entries; wiped on a RESET_ID change.
     learned: dict = field(default_factory=dict)
+    # daily loss circuit breaker
+    daily_loss_usd: float = 0.0
+    daily_session_date: str = ""
     # the currently-open trade, persisted so a restart (railway redeploy) does
     # not lose track of a live position. None when flat. keys mirror the fields
     # a broker needs to resume settling: symbol, side, is_buy, size, entry,
@@ -56,7 +60,7 @@ class BotState:
 
     def record(self, t: TradeRecord) -> None:
         self.trades.append(asdict(t))
-        self.trades = self.trades[-500:]
+        self.trades = self.trades[-100:]  # keep only what reflection actually needs
         self.realized_pnl += t.pnl
         # a win is real profit; a loss is real loss. an exact breakeven (after
         # fees, vanishingly rare) is counted as neither so it never inflates the

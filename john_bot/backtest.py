@@ -72,6 +72,11 @@ def simulate(symbol: str, candles: List[Candle], cfg) -> List[SimTrade]:
             break  # ran out of data with an open trade
         r = plan.rr if reason == "TP" else -1.0
         trades.append(SimTrade(plan.side, entry, exit_px, reason, j - i, r))
+        # compound equity like the live bot does, so the backtest reflects the
+        # truth of compounding instead of a flat-equity fiction.
+        risk = plan.size * abs(plan.entry_ref - plan.stop_loss)
+        pnl = plan.rr * risk if reason == "TP" else -risk
+        equity = max(cfg.min_sizing_base, equity + pnl)
         i = j + 1  # flat again after exit
     return trades
 

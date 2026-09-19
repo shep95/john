@@ -130,7 +130,9 @@ class PaperBroker:
 
     def restore_position(self, d: dict) -> None:
         """rebuild an open position persisted before a restart so settling can
-        resume where it left off (paper equity itself resets to PAPER_EQUITY)."""
+        resume where it left off. paper equity is re-seeded from state.sizing_base
+        by the engine (not cfg.paper_equity) so paper sizing stays consistent
+        across restarts; cfg.paper_equity is only the first-boot value."""
         self.pos = Position(
             symbol=d["symbol"], side=d["side"], is_buy=bool(d["is_buy"]),
             size=float(d["size"]), entry=float(d["entry"]),

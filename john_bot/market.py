@@ -11,6 +11,10 @@ from typing import List, Optional
 
 import requests
 
+from .logutil import get_logger
+
+log = get_logger()
+
 MAINNET_INFO_URL = "https://api.hyperliquid.xyz/info"
 TESTNET_INFO_URL = "https://api.hyperliquid-testnet.xyz/info"
 
@@ -82,7 +86,9 @@ class Candle:
 class MarketData:
     """pulls closed candles from hyperliquid's public info endpoint (keyless)."""
 
-    def __init__(self, testnet: bool = False, timeout: float = 10.0):
+    def __init__(self, testnet: bool = False, timeout: float = 4.0):
+        # 4s timeout keeps the engine loop from going blind on an open position;
+        # 2 retries => at most ~8s of blocking before it fails loudly.
         self.url = TESTNET_INFO_URL if testnet else MAINNET_INFO_URL
         self.timeout = timeout
         self._session = requests.Session()
@@ -90,7 +96,7 @@ class MarketData:
     def interval_ms(self, interval: str) -> int:
         return _INTERVAL_MS.get(interval, 300_000)
 
-    def _post(self, payload: dict, retries: int = 3) -> object:
+    def _post(self, payload: dict, retries: int = 2) -> object:
         last_err: Optional[Exception] = None
         for attempt in range(retries):
             try:
@@ -99,6 +105,10 @@ class MarketData:
                 return r.json()
             except Exception as e:  # network / 429 / 5xx
                 last_err = e
+                # truth alert: never let the data feed struggle silently.
+                if attempt == retries - 1:
+                    log.warning("market data feed failing (attempt %d/%d): %s",
+                                attempt + 1, retries, e)
                 time.sleep(0.6 * (attempt + 1))
         raise RuntimeError(f"hyperliquid info request failed: {last_err}")
 

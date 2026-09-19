@@ -14,6 +14,7 @@ only one position at a time. blank/unclear reads = no trade, wait for context.
 """
 from __future__ import annotations
 
+import datetime
 import threading
 import time
 from typing import Optional
@@ -53,6 +54,11 @@ class Engine:
             self.state.sizing_base = base
             self.state.start_base = base
 
+        # paper mode: re-seed equity from the persisted sizing base so paper
+        # sizing stays consistent across restarts (cfg.paper_equity is first-boot only)
+        if hasattr(self.broker, "_equity") and self.state.sizing_base > 0:
+            self.broker._equity = self.state.sizing_base
+
         # resume tracking any position that was open before a restart
         self._restore_open_position()
 
@@ -78,7 +84,12 @@ class Engine:
         self.state.last_trade_duration = 0.0
         self.state.trades = []
         self.state.learned = {}   # forget self-learned rules on a fresh scoreboard
+        self.state.daily_loss_usd = 0.0
         self.state.reset_id = self.cfg.reset_id
+        # a reset is an acknowledgment of what came before, not a clean escape:
+        # require a real pause before the next entry.
+        self.state.cooldown_until = time.time() + (self.cfg.min_cooldown_sec * 6)
+        self.log.info("scoreboard wiped. mandatory cooldown applied before next entry.")
         save_state(self.cfg.state_path, self.state)
 
     def _restore_open_position(self) -> None:
@@ -149,7 +160,36 @@ class Engine:
                 compounded, banked = pnl, 0.0
                 self.state.sizing_base += pnl
             self.state.sizing_base = max(self.state.sizing_base, self.cfg.min_sizing_base)
+            # the ceiling is the sabbath of the sizing base: everything above it
+            # is banked, never recycled into risk.
+            if self.cfg.max_sizing_base > 0 and self.state.sizing_base > self.cfg.max_sizing_base:
+                overflow = self.state.sizing_base - self.cfg.max_sizing_base
+                self.state.sizing_base = self.cfg.max_sizing_base
+                self.state.banked_reserve += overflow
+                banked += overflow
         return compounded, banked
+
+    def _check_daily_loss_cap(self, closed: ClosedTrade) -> None:
+        """session-level circuit breaker: once the day's realized loss reaches
+        MAX_DAILY_LOSS_PCT of the sizing base, pause new entries until a human
+        resumes. know the condition of your flocks (Prov 27:23)."""
+        today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+        if self.state.daily_session_date != today:
+            self.state.daily_session_date = today
+            self.state.daily_loss_usd = 0.0
+        if closed.pnl < 0:
+            self.state.daily_loss_usd += abs(closed.pnl)
+        cap = self.state.sizing_base * self.cfg.max_daily_loss_pct
+        if cap > 0 and self.state.daily_loss_usd >= cap and not self.state.paused:
+            self.state.paused = True
+            self.log.warning("daily loss cap hit (%.2f >= %.2f) -- paused", self.state.daily_loss_usd, cap)
+            self.notifier.send_embed(
+                "🛑 daily loss cap reached — session paused",
+                [("daily loss", money(self.state.daily_loss_usd), True),
+                 ("cap", money(cap), True),
+                 ("action", "no new entries until you /resume", False)],
+                RED, ping=True,
+            )
 
     def _finish_trade(self, closed: ClosedTrade) -> None:
         # pull the entry-time read features (stashed at open) for reflection
@@ -162,8 +202,10 @@ class Engine:
             strength=float(feats.get("strength", 0.0)), net_force=float(feats.get("net_force", 0.0)),
             passion=float(feats.get("passion", 0.0)), conflict=float(feats.get("conflict", 0.0)),
             echo_len=int(feats.get("echo_len", 0)), rr=float(feats.get("rr", 0.0)),
+            risk_usd=float(feats.get("risk_usd", 0.0)),
         ))
         compounded, banked = self._apply_compounding(closed.pnl)
+        self._check_daily_loss_cap(closed)
         cd = self._cooldown_from(closed)
         self.state.cooldown_until = time.time() + cd
         self._advance_rotation()
@@ -183,6 +225,9 @@ class Engine:
         so it self-corrects both ways: it adopts a rule when the data supports
         one, changes the threshold as data grows, and drops the rule on its own
         when the data no longer justifies it. no manual step is ever involved."""
+        # no reflection noise before there is real data to reflect on
+        if len(self.state.trades) < self.cfg.min_trades_to_learn:
+            return
         try:
             r = reflect(self.state.trades, self.cfg)
         except Exception as e:
@@ -191,6 +236,9 @@ class Engine:
         self._last_reflection = r
         self.log.info("[reflect] %s", r.summary)
         if not self.cfg.self_learn:
+            # report-only: surface the idea, never silently change its own rules.
+            if r.proposal is not None:
+                self.log.info("[reflect] proposal (SELF_LEARN off, not adopted): %s", r.proposal.human())
             return
 
         old = dict(self.state.learned)
@@ -198,20 +246,18 @@ class Engine:
         if new == old:
             return  # nothing changed this cycle
 
-        self.state.learned = new
-        save_state(self.cfg.state_path, self.state)
-
-        # describe what it changed, on its own
+        # describe what it changed
         if r.proposal is None:
             change = f"dropped rule ({', '.join(old)}) — no longer justified by the data"
-            title, rule_line = "🧠 john relaxed a rule", "back to base rules"
+            rule_line = "back to base rules"
         elif not old:
             change = f"adopted: {r.proposal.human()}"
-            title, rule_line = "🧠 john tuned itself", r.proposal.human()
+            rule_line = r.proposal.human()
         else:
             change = f"changed rule: {', '.join(old)} → {r.proposal.human()}"
-            title, rule_line = "🧠 john re-tuned itself", r.proposal.human()
-        self.log.info("[reflect] AUTO %s", change)
+            rule_line = r.proposal.human()
+
+        # alert first, adopt second. never silently change your own rules.
         fields = [
             ("reviewed", f"{r.n} trades", True),
             ("win rate", f"{r.winrate:.0f}%", True),
@@ -220,7 +266,11 @@ class Engine:
             ("active rule", rule_line, False),
             ("its critique", r.worst_pattern, False),
         ]
-        self.notifier.send_embed(title, fields, BLUE, ping=False)
+        self.notifier.send_embed("🧠 rule change — REVIEW (auto-adopted, SELF_LEARN on)",
+                                 fields, BLUE, ping=True)
+        self.state.learned = new
+        save_state(self.cfg.state_path, self.state)
+        self.log.info("[reflect] AUTO %s", change)
 
     def _settle_open(self) -> None:
         pos = self.broker.any_position()
@@ -249,6 +299,10 @@ class Engine:
     def _maybe_enter(self) -> None:
         now = time.time()
         if self.state.paused:
+            return
+        # trading-hours window (UTC): outside it, the algorithm rests. 12 on / 12 off.
+        hour = datetime.datetime.now(datetime.timezone.utc).hour
+        if not (self.cfg.session_start_utc_hour <= hour < self.cfg.session_end_utc_hour):
             return
         if now < self.state.cooldown_until:
             return
@@ -286,6 +340,7 @@ class Engine:
                 "strength": read.conviction, "net_force": read.dominance,
                 "passion": read.passion, "conflict": read.conflict,
                 "echo_len": read.echo.length, "rr": plan.rr,
+                "risk_usd": plan.sl_dist * plan.size,  # $ at the stop, for real R
             }
             self.state.open_position = d or None
             self._alert_entry(plan)
@@ -413,7 +468,26 @@ class Engine:
                 break
             except Exception as e:
                 self.log.exception("tick error: %s", e)
+                self._alert_feed_trouble(e)
             time.sleep(self.cfg.poll_seconds)
+
+    def _alert_feed_trouble(self, err: Exception) -> None:
+        """a truth alert (not a trade alert): tell the operator when the engine
+        is failing on data/feed errors, throttled to once every 10 minutes so an
+        outage does not spam. decisions on false/stale data are the road to ruin."""
+        now = time.time()
+        if now - getattr(self, "_last_feed_alert", 0.0) < 600:
+            return
+        self._last_feed_alert = now
+        try:
+            self.notifier.send_embed(
+                "⚠️ data / engine error — operator should check",
+                [("error", str(err)[:300], False),
+                 ("note", "the bot skipped this cycle; it will keep retrying", False)],
+                RED, ping=True,
+            )
+        except Exception:
+            pass
 
 
 def main() -> None:

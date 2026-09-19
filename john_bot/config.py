@@ -61,14 +61,14 @@ class Config:
         ]
     )
     interval: str = field(default_factory=lambda: _s("INTERVAL", "5m"))
-    leverage: int = field(default_factory=lambda: _i("LEVERAGE", 5))
+    leverage: int = field(default_factory=lambda: _i("LEVERAGE", 2))  # 2x: participate, don't be enslaved
     cross_margin: bool = field(default_factory=lambda: _b("CROSS_MARGIN", False))
 
     # --- sizing / risk ---
     paper_equity: float = field(default_factory=lambda: _f("PAPER_EQUITY", 1000.0))
     risk_frac: float = field(default_factory=lambda: _f("RISK_FRAC", 0.02))  # risk per trade at SL
-    max_position_frac: float = field(default_factory=lambda: _f("MAX_POSITION_FRAC", 0.5))
-    slippage: float = field(default_factory=lambda: _f("SLIPPAGE", 0.02))
+    max_position_frac: float = field(default_factory=lambda: _f("MAX_POSITION_FRAC", 0.20))  # <=20% notional/trade
+    slippage: float = field(default_factory=lambda: _f("SLIPPAGE", 0.005))  # 0.5%: patience over impatience
 
     # --- compounding ---
     # fraction of each *profit* that is compounded back into the sizing base.
@@ -76,6 +76,12 @@ class Config:
     # losses come fully out of the sizing base.
     compound_frac: float = field(default_factory=lambda: _f("COMPOUND_FRAC", 0.40))
     min_sizing_base: float = field(default_factory=lambda: _f("MIN_SIZING_BASE", 10.0))
+    # ceiling on how large the sizing base may grow via compounding. everything
+    # above it is banked, not recycled into risk. 0 = no ceiling.
+    max_sizing_base: float = field(default_factory=lambda: _f("MAX_SIZING_BASE", 0.0))
+    # session-level circuit breaker: pause new entries once the day's realized
+    # loss reaches this fraction of the sizing base.
+    max_daily_loss_pct: float = field(default_factory=lambda: _f("MAX_DAILY_LOSS_PCT", 0.06))
 
     # --- discord ---
     discord_bot_token: str = field(default_factory=lambda: _s("DISCORD_BOT_TOKEN", ""))
@@ -89,7 +95,7 @@ class Config:
     atr_lookback: int = field(default_factory=lambda: _i("ATR_LOOKBACK", 14))  # atrLen
     frame_len: int = field(default_factory=lambda: _i("FRAME_LEN", 50))        # frameLen
     normal_len: int = field(default_factory=lambda: _i("NORMAL_LEN", 50))      # normLen
-    history_candles: int = field(default_factory=lambda: _i("HISTORY_CANDLES", 120))
+    history_candles: int = field(default_factory=lambda: _i("HISTORY_CANDLES", 60))  # 5h of 5m data is enough
 
     # --- velocity / trend gates (asherin.pine :: velocity/trend) ---
     trend_thresh: float = field(default_factory=lambda: _f("TREND_THRESH", 0.25))  # trendThresh
@@ -125,9 +131,12 @@ class Config:
 
     # --- timing / cooldown (narrative: cooldown = last trade duration) ---
     poll_seconds: int = field(default_factory=lambda: _i("POLL_SECONDS", 20))
-    min_cooldown_sec: int = field(default_factory=lambda: _i("MIN_COOLDOWN_SEC", 300))
+    min_cooldown_sec: int = field(default_factory=lambda: _i("MIN_COOLDOWN_SEC", 1800))  # 30m minimum rest
     max_cooldown_sec: int = field(default_factory=lambda: _i("MAX_COOLDOWN_SEC", 14400))
     cooldown_mode: str = field(default_factory=lambda: _s("COOLDOWN_MODE", "trade_duration"))
+    # trading-hours window (UTC). the algorithm rests outside it. 12 on / 12 off.
+    session_start_utc_hour: int = field(default_factory=lambda: _i("SESSION_START_HOUR", 8))
+    session_end_utc_hour: int = field(default_factory=lambda: _i("SESSION_END_HOUR", 20))
 
     # --- persistence ---
     state_path: str = field(default_factory=lambda: _s("STATE_PATH", "state.json"))
@@ -140,10 +149,10 @@ class Config:
     # after each closed trade, once there are >= min_trades_to_learn trades, the
     # bot reviews its own history and may adopt a new entry filter (only ever
     # making entries pickier). set SELF_LEARN=false to keep it report-only.
-    self_learn: bool = field(default_factory=lambda: _b("SELF_LEARN", True))
+    self_learn: bool = field(default_factory=lambda: _b("SELF_LEARN", False))  # explicit opt-in
     min_trades_to_learn: int = field(default_factory=lambda: _i("MIN_TRADES_TO_LEARN", 20))
-    learn_margin: float = field(default_factory=lambda: _f("LEARN_MARGIN", 0.20))  # min R gain to adopt
-    learn_keep_frac: float = field(default_factory=lambda: _f("LEARN_KEEP_FRAC", 0.5))
+    learn_margin: float = field(default_factory=lambda: _f("LEARN_MARGIN", 0.50))  # min R gain to adopt
+    learn_keep_frac: float = field(default_factory=lambda: _f("LEARN_KEEP_FRAC", 0.75))  # keep >=75% of trades
 
     @property
     def is_live(self) -> bool:
