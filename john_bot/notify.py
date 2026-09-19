@@ -248,23 +248,6 @@ class BotNotifier:
             e.add_field(name="summary", value=r["summary"], inline=False)
             await interaction.response.send_message(embed=e)
 
-        @bot.tree.command(name="mute", description="stop entry/exit alerts for a coin (e.g. DOGE)")
-        async def mute_cmd(interaction: discord.Interaction, symbol: str):
-            engine.mute_symbol(symbol)
-            muted = ", ".join(engine.muted_symbols()) or "none"
-            await interaction.response.send_message(f"🔇 muted **{symbol.upper()}** alerts. muted now: {muted}")
-
-        @bot.tree.command(name="unmute", description="resume entry/exit alerts for a coin")
-        async def unmute_cmd(interaction: discord.Interaction, symbol: str):
-            engine.unmute_symbol(symbol)
-            muted = ", ".join(engine.muted_symbols()) or "none"
-            await interaction.response.send_message(f"🔔 unmuted **{symbol.upper()}** alerts. muted now: {muted}")
-
-        @bot.tree.command(name="muted", description="list coins whose alerts are silenced")
-        async def muted_cmd(interaction: discord.Interaction):
-            muted = ", ".join(engine.muted_symbols()) or "none — all coins alert"
-            await interaction.response.send_message(f"🔕 muted coins: {muted}")
-
         try:
             bot.run(cfg.discord_bot_token, log_handler=None)
         except Exception as e:

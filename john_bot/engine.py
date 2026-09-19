@@ -85,7 +85,6 @@ class Engine:
         self.state.trades = []
         self.state.learned = {}   # forget self-learned rules on a fresh scoreboard
         self.state.daily_loss_usd = 0.0
-        self.state.daily_profit_usd = 0.0
         self.state.reset_id = self.cfg.reset_id
         # a reset is an acknowledgment of what came before, not a clean escape:
         # require a real pause before the next entry.
@@ -170,44 +169,26 @@ class Engine:
                 banked += overflow
         return compounded, banked
 
-    def _check_daily_caps(self, closed: ClosedTrade) -> None:
-        """session-level circuit breakers, reset each UTC day:
-          * daily LOSS  >= MAX_DAILY_LOSS_PCT of the sizing base -> pause.
-          * daily PROFIT >= MAX_DAILY_PROFIT_USD -> pause (take the day's win).
-        both pause new entries until a human /resume."""
+    def _check_daily_loss_cap(self, closed: ClosedTrade) -> None:
+        """session-level circuit breaker: once the day's realized loss reaches
+        MAX_DAILY_LOSS_PCT of the sizing base, pause new entries until a human
+        resumes. know the condition of your flocks (Prov 27:23)."""
         today = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
         if self.state.daily_session_date != today:
             self.state.daily_session_date = today
             self.state.daily_loss_usd = 0.0
-            self.state.daily_profit_usd = 0.0
         if closed.pnl < 0:
             self.state.daily_loss_usd += abs(closed.pnl)
-        elif closed.pnl > 0:
-            self.state.daily_profit_usd += closed.pnl
-
-        loss_cap = self.state.sizing_base * self.cfg.max_daily_loss_pct
-        if loss_cap > 0 and self.state.daily_loss_usd >= loss_cap and not self.state.paused:
+        cap = self.state.sizing_base * self.cfg.max_daily_loss_pct
+        if cap > 0 and self.state.daily_loss_usd >= cap and not self.state.paused:
             self.state.paused = True
-            self.log.warning("daily loss cap hit (%.2f >= %.2f) -- paused", self.state.daily_loss_usd, loss_cap)
+            self.log.warning("daily loss cap hit (%.2f >= %.2f) -- paused", self.state.daily_loss_usd, cap)
             self.notifier.send_embed(
                 "🛑 daily loss cap reached — session paused",
                 [("daily loss", money(self.state.daily_loss_usd), True),
-                 ("cap", money(loss_cap), True),
+                 ("cap", money(cap), True),
                  ("action", "no new entries until you /resume", False)],
                 RED, ping=True,
-            )
-            return
-
-        profit_cap = self.cfg.max_daily_profit_usd
-        if profit_cap > 0 and self.state.daily_profit_usd >= profit_cap and not self.state.paused:
-            self.state.paused = True
-            self.log.info("daily profit target hit (%.2f >= %.2f) -- paused", self.state.daily_profit_usd, profit_cap)
-            self.notifier.send_embed(
-                "🎯 daily profit target reached — session paused",
-                [("daily profit", money(self.state.daily_profit_usd), True),
-                 ("target", money(profit_cap), True),
-                 ("action", "resting for the day; /resume to keep trading", False)],
-                GREEN, ping=True,
             )
 
     def _finish_trade(self, closed: ClosedTrade) -> None:
@@ -224,7 +205,7 @@ class Engine:
             risk_usd=float(feats.get("risk_usd", 0.0)),
         ))
         compounded, banked = self._apply_compounding(closed.pnl)
-        self._check_daily_caps(closed)
+        self._check_daily_loss_cap(closed)
         cd = self._cooldown_from(closed)
         self.state.cooldown_until = time.time() + cd
         self._advance_rotation()
@@ -366,30 +347,7 @@ class Engine:
             save_state(self.cfg.state_path, self.state)
 
     # -- alerts --------------------------------------------------------------
-    def _alerts_muted(self, symbol: str) -> bool:
-        s = symbol.upper()
-        return s in self.cfg.mute_alert_symbols or s in self.state.muted_alerts
-
-    def mute_symbol(self, symbol: str) -> None:
-        s = symbol.upper()
-        with self._lock:
-            if s not in self.state.muted_alerts:
-                self.state.muted_alerts.append(s)
-        save_state(self.cfg.state_path, self.state)
-
-    def unmute_symbol(self, symbol: str) -> None:
-        s = symbol.upper()
-        with self._lock:
-            if s in self.state.muted_alerts:
-                self.state.muted_alerts.remove(s)
-        save_state(self.cfg.state_path, self.state)
-
-    def muted_symbols(self) -> list:
-        return sorted(set(self.cfg.mute_alert_symbols) | set(self.state.muted_alerts))
-
     def _alert_entry(self, plan: TradePlan) -> None:
-        if self._alerts_muted(plan.symbol):
-            return
         est_profit = plan.tp_dist * plan.size
         est_loss = plan.sl_dist * plan.size
         # money actually committed to the trade = margin = notional / leverage
@@ -414,8 +372,6 @@ class Engine:
         self.notifier.send_embed("📈 trade entered", fields, GREEN, ping=True)
 
     def _alert_exit(self, closed: ClosedTrade, compounded: float, banked: float, cd: float) -> None:
-        if self._alerts_muted(closed.symbol):
-            return
         won = closed.pnl >= 0
         head = "✅ TP hit" if closed.reason == "TP" else ("🛑 SL hit" if closed.reason == "SL" else "⏹️ flattened")
         total = self.state.wins + self.state.losses

@@ -82,9 +82,6 @@ class Config:
     # session-level circuit breaker: pause new entries once the day's realized
     # loss reaches this fraction of the sizing base.
     max_daily_loss_pct: float = field(default_factory=lambda: _f("MAX_DAILY_LOSS_PCT", 0.06))
-    # daily profit target ($). once the day's realized profit reaches it, pause
-    # new entries for the day. 0 = no profit cap.
-    max_daily_profit_usd: float = field(default_factory=lambda: _f("MAX_DAILY_PROFIT_USD", 3000.0))
 
     # --- discord ---
     discord_bot_token: str = field(default_factory=lambda: _s("DISCORD_BOT_TOKEN", ""))
@@ -92,11 +89,6 @@ class Config:
     discord_guild_id: str = field(default_factory=lambda: _s("DISCORD_GUILD_ID", ""))
     discord_webhook_url: str = field(default_factory=lambda: _s("DISCORD_WEBHOOK_URL", ""))
     discord_user_id: str = field(default_factory=lambda: _s("DISCORD_USER_ID", ""))
-    # coins whose entry/exit alerts are silenced (comma-separated). runtime /mute
-    # adds more on top of this. system alerts (daily-loss, errors) are never muted.
-    mute_alert_symbols: List[str] = field(
-        default_factory=lambda: [s.strip().upper() for s in _s("MUTE_ALERT_SYMBOLS", "").split(",") if s.strip()]
-    )
 
     # --- analysis windows (asherin.pine :: core windows) ---
     war_window: int = field(default_factory=lambda: _i("WAR_WINDOW", 7))       # warWin
