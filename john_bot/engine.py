@@ -347,7 +347,30 @@ class Engine:
             save_state(self.cfg.state_path, self.state)
 
     # -- alerts --------------------------------------------------------------
+    def _alerts_muted(self, symbol: str) -> bool:
+        s = symbol.upper()
+        return s in self.cfg.mute_alert_symbols or s in self.state.muted_alerts
+
+    def mute_symbol(self, symbol: str) -> None:
+        s = symbol.upper()
+        with self._lock:
+            if s not in self.state.muted_alerts:
+                self.state.muted_alerts.append(s)
+        save_state(self.cfg.state_path, self.state)
+
+    def unmute_symbol(self, symbol: str) -> None:
+        s = symbol.upper()
+        with self._lock:
+            if s in self.state.muted_alerts:
+                self.state.muted_alerts.remove(s)
+        save_state(self.cfg.state_path, self.state)
+
+    def muted_symbols(self) -> list:
+        return sorted(set(self.cfg.mute_alert_symbols) | set(self.state.muted_alerts))
+
     def _alert_entry(self, plan: TradePlan) -> None:
+        if self._alerts_muted(plan.symbol):
+            return
         est_profit = plan.tp_dist * plan.size
         est_loss = plan.sl_dist * plan.size
         # money actually committed to the trade = margin = notional / leverage
@@ -372,6 +395,8 @@ class Engine:
         self.notifier.send_embed("📈 trade entered", fields, GREEN, ping=True)
 
     def _alert_exit(self, closed: ClosedTrade, compounded: float, banked: float, cd: float) -> None:
+        if self._alerts_muted(closed.symbol):
+            return
         won = closed.pnl >= 0
         head = "✅ TP hit" if closed.reason == "TP" else ("🛑 SL hit" if closed.reason == "SL" else "⏹️ flattened")
         total = self.state.wins + self.state.losses

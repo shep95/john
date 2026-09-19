@@ -89,6 +89,11 @@ class Config:
     discord_guild_id: str = field(default_factory=lambda: _s("DISCORD_GUILD_ID", ""))
     discord_webhook_url: str = field(default_factory=lambda: _s("DISCORD_WEBHOOK_URL", ""))
     discord_user_id: str = field(default_factory=lambda: _s("DISCORD_USER_ID", ""))
+    # coins whose entry/exit alerts are silenced (comma-separated). runtime /mute
+    # adds more on top of this. system alerts (daily-loss, errors) are never muted.
+    mute_alert_symbols: List[str] = field(
+        default_factory=lambda: [s.strip().upper() for s in _s("MUTE_ALERT_SYMBOLS", "").split(",") if s.strip()]
+    )
 
     # --- analysis windows (asherin.pine :: core windows) ---
     war_window: int = field(default_factory=lambda: _i("WAR_WINDOW", 7))       # warWin
