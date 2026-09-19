@@ -49,8 +49,9 @@ class BotState:
     # self-learned entry filters adopted by the reflection loop (reflect.py).
     # only ever tighten entries; wiped on a RESET_ID change.
     learned: dict = field(default_factory=dict)
-    # daily loss circuit breaker
+    # daily circuit breakers (loss + profit), reset each UTC day
     daily_loss_usd: float = 0.0
+    daily_profit_usd: float = 0.0
     daily_session_date: str = ""
     # coins muted at runtime via /mute (on top of cfg.mute_alert_symbols)
     muted_alerts: List[str] = field(default_factory=list)

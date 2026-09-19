@@ -82,6 +82,9 @@ class Config:
     # session-level circuit breaker: pause new entries once the day's realized
     # loss reaches this fraction of the sizing base.
     max_daily_loss_pct: float = field(default_factory=lambda: _f("MAX_DAILY_LOSS_PCT", 0.06))
+    # daily profit target ($). once the day's realized profit reaches it, pause
+    # new entries for the day. 0 = no profit cap.
+    max_daily_profit_usd: float = field(default_factory=lambda: _f("MAX_DAILY_PROFIT_USD", 3000.0))
 
     # --- discord ---
     discord_bot_token: str = field(default_factory=lambda: _s("DISCORD_BOT_TOKEN", ""))
