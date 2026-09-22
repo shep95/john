@@ -143,6 +143,8 @@ class Config:
     min_cooldown_sec: int = field(default_factory=lambda: _i("MIN_COOLDOWN_SEC", 1800))  # 30m minimum rest
     max_cooldown_sec: int = field(default_factory=lambda: _i("MAX_COOLDOWN_SEC", 14400))
     cooldown_mode: str = field(default_factory=lambda: _s("COOLDOWN_MODE", "trade_duration"))
+    backtest_max_hold_bars: int = field(default_factory=lambda: _i("BACKTEST_MAX_HOLD_BARS", 288))
+    backtest_slippage: float = field(default_factory=lambda: _f("BACKTEST_SLIPPAGE", 0.005))
     # trading-hours window (UTC). the algorithm rests outside it. 12 on / 12 off.
     session_start_utc_hour: int = field(default_factory=lambda: _i("SESSION_START_HOUR", 8))
     session_end_utc_hour: int = field(default_factory=lambda: _i("SESSION_END_HOUR", 20))

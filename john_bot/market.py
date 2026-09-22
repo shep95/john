@@ -112,6 +112,20 @@ class MarketData:
                 time.sleep(0.6 * (attempt + 1))
         raise RuntimeError(f"hyperliquid info request failed: {last_err}")
 
+    def candles_between(self, coin: str, interval: str, start_ms: int, end_ms: int) -> List[Candle]:
+        """return candles in an explicit millisecond time range, oldest first."""
+        payload = {
+            "type": "candleSnapshot",
+            "req": {"coin": coin, "interval": interval,
+                    "startTime": int(start_ms), "endTime": int(end_ms)},
+        }
+        raw = self._post(payload)
+        if not isinstance(raw, list):
+            raise RuntimeError(f"unexpected candle response: {type(raw)}")
+        candles = [Candle.from_hl(d) for d in raw]
+        candles.sort(key=lambda c: c.open_time)
+        return [c for c in candles if c.open_time >= start_ms and c.close_time <= end_ms]
+
     def candles(self, coin: str, interval: str, count: int) -> List[Candle]:
         """return the most recent `count` candles for `coin`, oldest -> newest.
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import List
 
 from .analysis import LONG, NO_TRADE, analyze
@@ -28,34 +29,56 @@ class SimTrade:
     exit: float
     reason: str
     bars: int
-    r: float  # realized reward:risk multiple (+tp_rr on win, -1 on loss)
+    r: float
 
 
 def simulate(symbol: str, candles: List[Candle], cfg) -> List[SimTrade]:
+    """simulate the live timing conservatively: signal on closed bar, enter at
+    next open with slippage, charge both fees, enforce cooldown and breakers."""
     trades: List[SimTrade] = []
-    warmup = max(cfg.war_window, cfg.atr_lookback) + 2
+    warmup = max(cfg.war_window, cfg.atr_lookback, cfg.frame_len, cfg.normal_len) + 2
     i = warmup
     equity = cfg.paper_equity
-    n = len(candles)
-    while i < n - 1:
-        read = analyze(symbol, candles[: i + 1], cfg)
+    peak = equity
+    consecutive_losses = 0
+    cooldown_until = 0
+    interval_ms = 300_000
+    max_hold = max(1, cfg.backtest_max_hold_bars)
+    while i < len(candles) - 1:
+        if i < cooldown_until:
+            i += 1
+            continue
+        read = analyze(symbol, candles[:i + 1], cfg)
         if read.signal == NO_TRADE:
             i += 1
             continue
+        entry_bar = i + 1
         plan = build_plan(read, equity, 4, cfg)
         if plan is None:
             i += 1
             continue
-        entry = plan.entry_ref
-        sl, tp = plan.stop_loss, plan.take_profit
-        is_long = plan.side == LONG
-        # walk forward until a level is hit
-        j = i + 1
-        exit_px = None
+        raw_entry = candles[entry_bar].open
+        slip = cfg.backtest_slippage
+        entry = raw_entry * (1 + slip if plan.is_buy else 1 - slip)
+        direction = 1 if plan.is_buy else -1
+        sl_dist = abs(plan.entry_ref - plan.stop_loss)
+        tp_dist = abs(plan.take_profit - plan.entry_ref)
+        sl = entry - sl_dist if plan.is_buy else entry + sl_dist
+        tp = entry + tp_dist if plan.is_buy else entry - tp_dist
+        risk = plan.size * sl_dist
+        if risk <= 0:
+            i += 1
+            continue
+        entry_fee = entry * plan.size * 0.00045
+        equity -= entry_fee
         reason = None
-        while j < n:
+        exit_px = None
+        exit_bar = min(len(candles) - 1, entry_bar + max_hold)
+        # the entry fill occurs at the next bar open; protective orders can only
+        # be evaluated after that fill, never against the same open-price event.
+        for j in range(entry_bar + 1, exit_bar + 1):
             c = candles[j]
-            if is_long:
+            if plan.is_buy:
                 if c.low <= sl:
                     exit_px, reason = sl, "SL"
                 elif c.high >= tp:
@@ -66,25 +89,38 @@ def simulate(symbol: str, candles: List[Candle], cfg) -> List[SimTrade]:
                 elif c.low <= tp:
                     exit_px, reason = tp, "TP"
             if reason:
+                exit_bar = j
                 break
-            j += 1
         if reason is None:
-            break  # ran out of data with an open trade
-        r = plan.rr if reason == "TP" else -1.0
-        trades.append(SimTrade(plan.side, entry, exit_px, reason, j - i, r))
-        # compound equity like the live bot does, so the backtest reflects the
-        # truth of compounding instead of a flat-equity fiction.
-        risk = plan.size * abs(plan.entry_ref - plan.stop_loss)
-        pnl = plan.rr * risk if reason == "TP" else -risk
+            exit_px = candles[exit_bar].close
+            reason = "TIME"
+        assert exit_px is not None
+        exit_fee = exit_px * plan.size * 0.00045
+        gross = (exit_px - entry) * plan.size * direction
+        pnl = gross - entry_fee - exit_fee
+        r = pnl / risk if risk > 0 else 0.0
+        result = "TP" if reason == "TP" and r > 0 else ("SL" if reason == "SL" and r < 0 else reason)
+        trades.append(SimTrade(plan.side, entry, exit_px, result, exit_bar - i, r))
         equity = max(cfg.min_sizing_base, equity + pnl)
-        i = j + 1  # flat again after exit
+        peak = max(peak, equity)
+        consecutive_losses = consecutive_losses + 1 if pnl < 0 else 0
+        drawdown = (peak - equity) / peak if peak else 0.0
+        if (consecutive_losses >= cfg.max_consecutive_losses or
+                drawdown >= cfg.max_drawdown_pct):
+            break
+        cooldown_bars = max(1, int(cfg.min_cooldown_sec * 1000 / interval_ms))
+        duration_bars = max(1, exit_bar - entry_bar)
+        if cfg.cooldown_mode == "trade_duration":
+            cooldown_bars = max(cooldown_bars, duration_bars)
+        cooldown_until = exit_bar + cooldown_bars + 1
+        i = exit_bar + 1
     return trades
 
 
 def report(symbol: str, candles: List[Candle], cfg) -> None:
     trades = simulate(symbol, candles, cfg)
     n = len(trades)
-    wins = sum(1 for t in trades if t.reason == "TP")
+    wins = sum(1 for t in trades if t.r > 0)
     total_r = sum(t.r for t in trades)
     avg_bars = sum(t.bars for t in trades) / n if n else 0
     wr = (wins / n * 100) if n else 0.0
@@ -103,11 +139,23 @@ def report(symbol: str, candles: List[Candle], cfg) -> None:
           f"atr={read.atr:.5g}")
 
 
+def _utc_ms(value: str) -> int:
+    return int(datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+
 def main() -> None:
     args = sys.argv[1:]
     count = 500
     symbols = CONFIG.symbols
-    if args:
+    start_ms = end_ms = None
+    if args and args[0] == "between":
+        if len(args) < 3:
+            raise SystemExit("usage: python -m john_bot.backtest between YYYY-MM-DD YYYY-MM-DD [SYMBOL ...]")
+        start_ms = _utc_ms(args[1])
+        # end date is inclusive through the final millisecond of that UTC day.
+        end_ms = _utc_ms(args[2]) + 86_400_000 - 1
+        symbols = [s.upper() for s in args[3:]] or CONFIG.symbols
+    elif args:
         if args[0].isdigit():
             count = int(args[0])
         else:
@@ -116,7 +164,8 @@ def main() -> None:
                 count = int(args[1])
     md = MarketData(testnet=CONFIG.testnet)
     for sym in symbols:
-        candles = md.closed_candles(sym, CONFIG.interval, count)
+        candles = (md.candles_between(sym, CONFIG.interval, start_ms, end_ms)  # type: ignore[arg-type]
+                   if start_ms is not None and end_ms is not None else md.closed_candles(sym, CONFIG.interval, count))
         report(sym, candles, CONFIG)
 
 
