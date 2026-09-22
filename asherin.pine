@@ -21,6 +21,11 @@ wConf         = input.float(0.35, "weight: conflict density", step=0.05, group=g
 wWick         = input.float(0.25, "weight: wick / resistance", step=0.05, group=grpPassion)
 wPers         = input.float(0.20, "weight: persistence", step=0.05, group=grpPassion)
 passionThresh = input.float(1.00, "passion point threshold", step=0.10, group=grpPassion, tooltip="large move with no resistance is NOT auto high passion (section 8).")
+passionMax    = input.float(0.99, "entry max passion", step=0.01, group=grpPassion, tooltip="veto entries at or above this exhaustion threshold.")
+normVelMax    = input.float(0.49, "entry max |norm velocity|", step=0.01, group=grpPassion, tooltip="veto entries at or above this overextension threshold.")
+netForceMax   = input.float(2.80, "entry max |net force|", step=0.10, group=grpPassion, tooltip="veto extreme blowoff readings above this threshold.")
+netForceMin   = input.float(2.00, "entry min |net force|", step=0.10, group=grpPassion, tooltip="avoid underpowered winner readings.")
+rejectBouncing = input.bool(true, "reject bouncing entries", group=grpPassion)
 
 grpEcho     = "echo / normal rate (section 7 & 9)"
 echoTrigger = input.float(1.6, "echo trigger (range/ATR)", step=0.1, group=grpEcho)
@@ -84,7 +89,7 @@ framePos = (hh - ll) > 0 ? (close - ll) / (hh - ll) : 0.5
 // ============================================================
 // interaction primitives — the micro-war (section 4 & 5)
 // ============================================================
-netForce = atr > 0 ? math.sum(body / atr, warWin) : 0.0
+netForce = atr > 0 ? math.sum(body, warWin) / atr : 0.0
 netDir   = netForce > 0 ? 1 : netForce < 0 ? -1 : 0
 
 battles = 0
@@ -221,8 +226,14 @@ strength   = math.min(1.0, math.max(0.0, (passionRel / 2.0 + echoStrength) / 2.0
 
 signalLong  = winnerDir > 0 and echoDir > 0 and echoPresent
 signalShort = winnerDir < 0 and echoDir < 0 and echoPresent
-rawDir      = signalLong ? 1 : signalShort ? -1 : 0
-curSignal   = rawDir > 0 ? "LONG" : rawDir < 0 ? "SHORT" : (winnerDir == 0 ? "wait (no clear winner)" : not echoPresent ? "wait (no echo yet)" : "wait (echo disagrees)")
+overextended = passion >= passionMax or math.abs(normVel) >= normVelMax or math.abs(netForce) > netForceMax
+underpowered = math.abs(netForce) < netForceMin
+regimeBlocked = rejectBouncing and bouncing
+entryBlocked = overextended or underpowered or regimeBlocked
+actionableLong = not entryBlocked and signalLong
+actionableShort = not entryBlocked and signalShort
+rawDir      = actionableLong ? 1 : actionableShort ? -1 : 0
+curSignal   = rawDir > 0 ? "LONG" : rawDir < 0 ? "SHORT" : overextended ? "wait (overextended)" : underpowered ? "wait (underpowered)" : regimeBlocked ? "wait (bouncing)" : (winnerDir == 0 ? "wait (no clear winner)" : not echoPresent ? "wait (no echo yet)" : "wait (echo disagrees)")
 
 slMult = math.max(slFloor, baseSL * (1.0 - slSens * strength))
 tpMult = baseTP * (1.0 + tpSens * strength)

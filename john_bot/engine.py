@@ -41,6 +41,8 @@ class Engine:
         self._lock = threading.Lock()
         self._flatten_req = False
         self._last_reflection = None
+        self._consecutive_losses = 0
+        self._peak_sizing_base = 0.0
         if not cfg.symbols:
             raise ValueError("no symbols configured")
         self.state.rotation_idx %= len(cfg.symbols)
@@ -53,6 +55,7 @@ class Engine:
             base = self.broker.equity()
             self.state.sizing_base = base
             self.state.start_base = base
+        self._peak_sizing_base = max(self.state.sizing_base, self.state.start_base)
 
         # paper mode: re-seed equity from the persisted sizing base so paper
         # sizing stays consistent across restarts (cfg.paper_equity is first-boot only)
@@ -205,6 +208,22 @@ class Engine:
             risk_usd=float(feats.get("risk_usd", 0.0)),
         ))
         compounded, banked = self._apply_compounding(closed.pnl)
+        if closed.pnl < 0:
+            self._consecutive_losses += 1
+        else:
+            self._consecutive_losses = 0
+        self._peak_sizing_base = max(self._peak_sizing_base, self.state.sizing_base)
+        drawdown = ((self._peak_sizing_base - self.state.sizing_base) / self._peak_sizing_base
+                     if self._peak_sizing_base > 0 else 0.0)
+        if (self.cfg.max_consecutive_losses > 0 and
+                self._consecutive_losses >= self.cfg.max_consecutive_losses):
+            self.state.paused = True
+            self.log.warning("loss circuit breaker hit (%d consecutive losses) -- paused",
+                             self._consecutive_losses)
+        if self.cfg.max_drawdown_pct > 0 and drawdown >= self.cfg.max_drawdown_pct:
+            self.state.paused = True
+            self.log.warning("drawdown circuit breaker hit (%.2f%% >= %.2f%%) -- paused",
+                             drawdown * 100, self.cfg.max_drawdown_pct * 100)
         self._check_daily_loss_cap(closed)
         cd = self._cooldown_from(closed)
         self.state.cooldown_until = time.time() + cd
@@ -423,6 +442,9 @@ class Engine:
                 "winrate": (s.wins / total * 100) if total else 0.0,
                 "roi": roi,
                 "cooldown_remaining": max(0.0, s.cooldown_until - time.time()),
+                "consecutive_losses": self._consecutive_losses,
+                "drawdown_pct": ((self._peak_sizing_base - s.sizing_base) / self._peak_sizing_base * 100
+                                  if self._peak_sizing_base > 0 else 0.0),
             }
 
     def reflection_report(self) -> dict:

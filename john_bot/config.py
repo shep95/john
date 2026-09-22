@@ -108,6 +108,15 @@ class Config:
     w_pers: float = field(default_factory=lambda: _f("W_PERS", 0.20))
     passion_thresh: float = field(default_factory=lambda: _f("PASSION_THRESH", 1.00))
 
+    # --- entry overextension filters (validated trade-log pattern) ---
+    passion_max: float = field(default_factory=lambda: _f("PASSION_MAX", 0.99))
+    norm_vel_max: float = field(default_factory=lambda: _f("NORM_VEL_MAX", 0.49))
+    net_force_max: float = field(default_factory=lambda: _f("NET_FORCE_MAX", 2.80))
+    net_force_min: float = field(default_factory=lambda: _f("NET_FORCE_MIN", 2.00))
+    reject_bouncing: bool = field(default_factory=lambda: _b("REJECT_BOUNCING", True))
+    max_consecutive_losses: int = field(default_factory=lambda: _i("MAX_CONSECUTIVE_LOSSES", 3))
+    max_drawdown_pct: float = field(default_factory=lambda: _f("MAX_DRAWDOWN_PCT", 0.10))
+
     # --- echo / normal rate (asherin.pine :: echo) ---
     echo_trigger: float = field(default_factory=lambda: _f("ECHO_TRIGGER", 1.6))
     echo_max: int = field(default_factory=lambda: _i("ECHO_MAX", 6))

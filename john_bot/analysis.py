@@ -133,8 +133,8 @@ def analyze(symbol: str, candles: List[Candle], cfg, learned: Optional[dict] = N
     normVel = (disp / W) / atr_cur
     trendDir = _sign(normVel)
 
-    # ----- micro-war: netForce = sum(body/atr, warWin) with per-bar atr -----
-    netForce = sum(candles[L - k].body / atrs[L - k] for k in range(W))
+    # ----- micro-war: normalize every bar with the current ATR, matching pine -----
+    netForce = sum(candles[L - k].body / atr_cur for k in range(W))
     netDir = _sign(netForce)
 
     # battles / conflict density (adjacent colour flips inside the window)
@@ -189,10 +189,11 @@ def analyze(symbol: str, candles: List[Candle], cfg, learned: Optional[dict] = N
     winnerClear = warResolved or abs(netForce) >= cfg.dom_thresh
     winnerDir = (trendDir if warResolved else netDir) if winnerClear else 0
 
-    # ----- trade decision: winner + echo agree -> LONG/SHORT, else wait -----
+    # ----- trade decision: fresh winner + echo agreement, else wait -----
     signalLong = winnerDir > 0 and echoDir > 0 and echoPresent
     signalShort = winnerDir < 0 and echoDir < 0 and echoPresent
-    rawDir = 1 if signalLong else (-1 if signalShort else 0)
+    echoFresh = echoPresent and echoLen is not None and echoLen <= cfg.echo_max
+    rawDir = 1 if echoFresh and signalLong else (-1 if echoFresh and signalShort else 0)
 
     # ----- strength (drives SL/TP shaping in strategy.py) -----
     echoRecency = max(0.0, (cfg.echo_max - echoLen) / float(cfg.echo_max)) if echoPresent else 0.0
@@ -234,6 +235,21 @@ def analyze(symbol: str, candles: List[Candle], cfg, learned: Optional[dict] = N
             f"passion={passion:.2f} echo(dir={echoDir:+d},len={echo.length}) "
             f"strength={strength:.2f}"
         )
+
+    # validated overextension filters: a valid winner+echo signal is still too
+    # late when passion, velocity, or net force has already reached exhaustion.
+    # These veto entries; they never create or loosen a signal.
+    if read.signal in (LONG, SHORT):
+        if passion >= cfg.passion_max:
+            read.signal, read.reason = NO_TRADE, f"overextension veto: passion {passion:.2f} >= {cfg.passion_max:.2f}"
+        elif abs(normVel) >= cfg.norm_vel_max:
+            read.signal, read.reason = NO_TRADE, f"overextension veto: |normVel| {abs(normVel):.3f} >= {cfg.norm_vel_max:.2f}"
+        elif abs(netForce) < cfg.net_force_min:
+            read.signal, read.reason = NO_TRADE, f"underpowered veto: |netForce| {abs(netForce):.2f} < {cfg.net_force_min:.2f}"
+        elif abs(netForce) > cfg.net_force_max:
+            read.signal, read.reason = NO_TRADE, f"overextension veto: |netForce| {abs(netForce):.2f} > {cfg.net_force_max:.2f}"
+        elif cfg.reject_bouncing and upVel > cfg.conflict_thresh and dnVel > cfg.conflict_thresh:
+            read.signal, read.reason = NO_TRADE, "regime veto: bouncing / two-sided velocity"
 
     # self-learned filters (from reflect.py). they ONLY veto a trade the base
     # rules would have taken -- they can never create or loosen one.
