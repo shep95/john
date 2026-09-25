@@ -1,4 +1,4 @@
-"""market data: a candle model + the hyperliquid 5m feed.
+"""market data: a candle model + the hyperliquid candle feed.
 
 a candle here is john's "observation of movement" (narrative section 1) --
 we keep raw ohlcv and derive meaning later, never treating shape alone as truth.
@@ -86,9 +86,9 @@ class Candle:
 class MarketData:
     """pulls closed candles from hyperliquid's public info endpoint (keyless)."""
 
-    def __init__(self, testnet: bool = False, timeout: float = 4.0):
-        # 4s timeout keeps the engine loop from going blind on an open position;
-        # 2 retries => at most ~8s of blocking before it fails loudly.
+    def __init__(self, testnet: bool = False, timeout: float = 10.0):
+        # 10s covers the 5000-candle warmup request; normal polls return fast.
+        # 2 retries => bounded blocking before it fails loudly.
         self.url = TESTNET_INFO_URL if testnet else MAINNET_INFO_URL
         self.timeout = timeout
         self._session = requests.Session()
@@ -111,6 +111,20 @@ class MarketData:
                                 attempt + 1, retries, e)
                 time.sleep(0.6 * (attempt + 1))
         raise RuntimeError(f"hyperliquid info request failed: {last_err}")
+
+    def candles_between(self, coin: str, interval: str, start_ms: int, end_ms: int) -> List[Candle]:
+        """return candles in an explicit millisecond time range, oldest first."""
+        payload = {
+            "type": "candleSnapshot",
+            "req": {"coin": coin, "interval": interval,
+                    "startTime": int(start_ms), "endTime": int(end_ms)},
+        }
+        raw = self._post(payload)
+        if not isinstance(raw, list):
+            raise RuntimeError(f"unexpected candle response: {type(raw)}")
+        candles = [Candle.from_hl(d) for d in raw]
+        candles.sort(key=lambda c: c.open_time)
+        return [c for c in candles if c.open_time >= start_ms and c.close_time <= end_ms]
 
     def candles(self, coin: str, interval: str, count: int) -> List[Candle]:
         """return the most recent `count` candles for `coin`, oldest -> newest.
@@ -139,6 +153,14 @@ class MarketData:
         cs = self.candles(coin, interval, count + 1)
         closed = [c for c in cs if c.close_time <= now]
         return closed[-count:]
+
+    def closed_since(self, coin: str, interval: str, after_open_ms: int) -> List[Candle]:
+        """closed candles that opened after `after_open_ms`, oldest first."""
+        span = self.interval_ms(interval)
+        now = int(time.time() * 1000)
+        missing = max(1, int((now - after_open_ms) // span) + 1)
+        cs = self.closed_candles(coin, interval, min(missing + 1, 5000))
+        return [c for c in cs if c.open_time > after_open_ms]
 
     def last_price(self, coin: str, interval: str) -> float:
         cs = self.candles(coin, interval, 1)

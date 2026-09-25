@@ -1,12 +1,12 @@
-"""john algro bot.
+"""john bot.
 
-a non-ai, rules-based futures trading bot that turns john's chart narrative
-(movement + context + velocity = meaning) into a concrete algorithm and trades
-it on hyperliquid with 5x leverage on a 5m chart, rotating eth <-> doge.
+a rules-based perpetual-futures bot that runs the shepherd · movement indicator
+(shepherd.pine) bar for bar in python and trades it on hyperliquid — but only
+once the indicator's own simulated record on that market proves an edge.
 
-the narrative -> code mapping lives in john_bot/analysis.py. every trade
-decision is deterministic math over the last N closed candles. no model,
-no learning at runtime -- just the primitives john described.
+no model, no runtime self-tuning. every decision is deterministic math over
+closed candles. see john_bot/shepherd.py (the read) and john_bot/gate.py (the
+permission to trade).
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

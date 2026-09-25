@@ -1,12 +1,12 @@
-"""tiny json-file persistence so restarts (railway redeploys) keep rotation,
-cooldown, and trade stats. no secrets ever written here.
+"""tiny json-file persistence so restarts (railway redeploys) keep stats, the
+open trade and the circuit-breaker state. no secrets ever written here.
 """
 from __future__ import annotations
 
 import json
 import os
 import tempfile
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from typing import List, Optional
 
 
@@ -21,55 +21,38 @@ class TradeRecord:
     opened_at: float
     closed_at: float
     duration_sec: float
-    # entry-time read features, kept so the bot can reflect on WHY it won/lost
-    strength: float = 0.0
-    net_force: float = 0.0
-    passion: float = 0.0
-    conflict: float = 0.0
-    echo_len: int = 0
-    rr: float = 0.0
-    risk_usd: float = 0.0   # $ that would be lost at the stop, for real R-multiples
+    r: float = 0.0
+    risk_usd: float = 0.0
 
 
 @dataclass
 class BotState:
-    rotation_idx: int = 0
-    cooldown_until: float = 0.0
-    last_trade_duration: float = 0.0
     trades: List[dict] = field(default_factory=list)
     realized_pnl: float = 0.0
     wins: int = 0
     losses: int = 0
     # compounding
     sizing_base: float = 0.0        # capital actually used for position sizing
-    banked_reserve: float = 0.0     # profit set aside (the 60% not compounded)
-    start_base: float = 0.0         # first sizing_base, for roi
-    paused: bool = False
-    reset_id: str = ""              # matches cfg.reset_id; a mismatch wipes stats
-    # self-learned entry filters adopted by the reflection loop (reflect.py).
-    # only ever tighten entries; wiped on a RESET_ID change.
-    learned: dict = field(default_factory=dict)
-    # daily loss circuit breaker
+    banked_reserve: float = 0.0     # profit set aside (the part not compounded)
+    start_base: float = 0.0
+    peak_base: float = 0.0
+    # breakers
+    paused: bool = False            # manual or drawdown pause — needs /resume
+    pause_until: float = 0.0        # timed pause after a losing streak
+    consecutive_losses: int = 0
     daily_loss_usd: float = 0.0
     daily_session_date: str = ""
-    # the currently-open trade, persisted so a restart (railway redeploy) does
-    # not lose track of a live position. None when flat. keys mirror the fields
-    # a broker needs to resume settling: symbol, side, is_buy, size, entry,
-    # stop_loss, take_profit, opened_at.
+    reset_id: str = ""
     open_position: Optional[dict] = None
 
     def record(self, t: TradeRecord) -> None:
         self.trades.append(asdict(t))
-        self.trades = self.trades[-100:]  # keep only what reflection actually needs
+        self.trades = self.trades[-200:]
         self.realized_pnl += t.pnl
-        # a win is real profit; a loss is real loss. an exact breakeven (after
-        # fees, vanishingly rare) is counted as neither so it never inflates the
-        # win column.
         if t.pnl > 0:
             self.wins += 1
         elif t.pnl < 0:
             self.losses += 1
-        self.last_trade_duration = t.duration_sec
 
 
 def load_state(path: str) -> BotState:
@@ -77,7 +60,9 @@ def load_state(path: str) -> BotState:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 d = json.load(f)
-            return BotState(**d)
+            known = {f.name for f in fields(BotState)}
+            # older state files carry keys (rotation, learned rules) that no longer exist
+            return BotState(**{k: v for k, v in d.items() if k in known})
         except Exception:
             pass
     return BotState()

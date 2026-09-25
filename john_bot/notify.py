@@ -3,7 +3,7 @@
 three modes, chosen automatically from env:
   - BotNotifier      : DISCORD_BOT_TOKEN + DISCORD_CHANNEL_ID set -> full bot with
                        slash commands (/status /position /pnl /pause /resume
-                       /flatten /params) AND channel alerts. runs in its own thread.
+                       /flatten /params /validate) AND channel alerts. runs in its own thread.
   - WebhookNotifier  : only DISCORD_WEBHOOK_URL set -> alerts only, no commands.
   - NullNotifier     : nothing set -> silent.
 
@@ -146,17 +146,18 @@ class BotNotifier:
 
         def _stats_fields() -> List[Field]:
             s = engine.snapshot()
-            wl = f"{s['wins']}/{s['losses']}"
+            gates = " · ".join(f"{k} {'open' if v else 'closed'}" for k, v in s["gates"].items())
             return [
-                ("mode", s["mode"], True),
-                ("active symbol", s["active_symbol"], True),
+                ("mode", f"{s['mode']} · {s['engine']} · {s['interval']}", True),
+                ("symbols", s["symbols"], True),
                 ("paused", "yes" if s["paused"] else "no", True),
+                ("gate", gates or "—", False),
+                ("entry block", s["block"] or "none", False),
                 ("sizing base", money(s["sizing_base"]), True),
-                ("banked (60%)", money(s["banked_reserve"]), True),
+                ("banked", money(s["banked_reserve"]), True),
                 ("realized pnl", money(s["realized_pnl"]), True),
-                ("win / loss", f"{wl}  ({s['winrate']:.0f}%)", True),
+                ("win / loss", f"{s['wins']}/{s['losses']}  ({s['winrate']:.0f}%)", True),
                 ("roi", f"{s['roi']:+.1f}%", True),
-                ("cooldown", f"{s['cooldown_remaining']:.0f}s", True),
             ]
 
         @bot.tree.command(name="status", description="bot status + stats")
@@ -192,7 +193,7 @@ class BotNotifier:
             e = discord.Embed(title="pnl & compounding", color=GREEN if s["realized_pnl"] >= 0 else RED)
             e.add_field(name="realized pnl", value=money(s["realized_pnl"]), inline=True)
             e.add_field(name="sizing base", value=money(s["sizing_base"]), inline=True)
-            e.add_field(name="banked (60%)", value=money(s["banked_reserve"]), inline=True)
+            e.add_field(name="banked", value=money(s["banked_reserve"]), inline=True)
             e.add_field(name="start base", value=money(s["start_base"]), inline=True)
             e.add_field(name="roi", value=f"{s['roi']:+.1f}%", inline=True)
             e.add_field(name="trades", value=f"{s['wins']+s['losses']}", inline=True)
@@ -218,34 +219,39 @@ class BotNotifier:
 
         @bot.tree.command(name="params", description="key strategy parameters")
         async def params(interaction: discord.Interaction):
+            p = cfg.params
             e = discord.Embed(title="parameters", color=GREY)
             e.add_field(name="symbols", value=",".join(cfg.symbols), inline=True)
             e.add_field(name="interval", value=cfg.interval, inline=True)
+            e.add_field(name="engine", value=cfg.engine, inline=True)
             e.add_field(name="leverage", value=f"{cfg.leverage}x", inline=True)
             e.add_field(name="risk/trade", value=f"{cfg.risk_frac*100:.1f}%", inline=True)
             e.add_field(name="compound", value=f"{cfg.compound_frac*100:.0f}%", inline=True)
-            e.add_field(name="war window", value=str(cfg.war_window), inline=True)
-            e.add_field(name="dom thr (net force)", value=f"{cfg.dom_thresh}", inline=True)
-            e.add_field(name="trend thr", value=f"{cfg.trend_thresh}", inline=True)
-            e.add_field(name="echo max", value=str(cfg.echo_max), inline=True)
-            e.add_field(name="cooldown", value=cfg.cooldown_mode, inline=True)
+            e.add_field(name="battle window", value=str(p.win), inline=True)
+            e.add_field(name="movement reversal", value=f"{p.seg_mult}× atr", inline=True)
+            e.add_field(name="cost assumed", value=f"{p.cost_pct:.2f}%", inline=True)
+            e.add_field(name="gate", value=(f"≥{cfg.min_trades} trades · exp ≥{cfg.min_expectancy_r:+.2f}R · "
+                                            f"t ≥{cfg.min_t_stat} · beats baselines"
+                                            if cfg.require_edge else "OFF (override)"), inline=False)
             await interaction.response.send_message(embed=e)
 
-        @bot.tree.command(name="reflect", description="john's self-review: errors + any rules it learned")
-        async def reflect_cmd(interaction: discord.Interaction):
-            r = engine.reflection_report()
-            e = discord.Embed(title="🧠 self-review", color=BLUE)
-            e.add_field(name="trades", value=str(r["n"]), inline=True)
-            e.add_field(name="win rate", value=f"{r['winrate']:.0f}%", inline=True)
-            e.add_field(name="expectancy", value=f"{r['expectancy']:+.2f}R", inline=True)
-            e.add_field(name="its critique", value=r["critique"], inline=False)
-            learned = r["learned"]
-            e.add_field(name="rules it learned",
-                        value=("\n".join(f"• {k} = {v}" for k, v in learned.items()) if learned else "none yet"),
-                        inline=False)
-            if r["proposal"]:
-                e.add_field(name="considering", value=r["proposal"], inline=False)
-            e.add_field(name="summary", value=r["summary"], inline=False)
+        @bot.tree.command(name="validate", description="the simulated record and the gate, per symbol")
+        async def validate(interaction: discord.Interaction):
+            rep = engine.validation_report()
+            e = discord.Embed(title="validation", color=BLUE)
+            for sym, d in rep.items():
+                v, g = d["validation"], d["gate"]
+                lines = []
+                for name in ("projection", "framework", "asherin", "momentum", "random"):
+                    x = v[name]
+                    exp = "—" if x["expectancy"] is None else f"{x['expectancy']:+.2f}R"
+                    wr = "—" if x["winrate"] is None else f"{x['winrate']*100:.0f}%"
+                    lines.append(f"`{name:<10} n={x['trades']:<4} win={wr:<4} exp={exp}`")
+                cal = " ".join(f"{c['bin']}→{'—' if c['real'] is None else format(c['real'], '.2f')}"
+                               for c in v["calibration"])
+                lines.append(f"calibration: {cal}")
+                lines.append(g.summary())
+                e.add_field(name=sym, value="\n".join(lines)[:1024], inline=False)
             await interaction.response.send_message(embed=e)
 
         try:

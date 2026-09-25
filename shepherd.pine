@@ -1,0 +1,957 @@
+//@version=6
+// shepherd · movement
+//
+// reads price as competing movement:
+// movement → battle window → war → resolution (winner) → echo → trade, exit taken from structure.
+// the projection layer turns the pattern probability into a live plan: direction, stop, target, and a
+// weighted entry that splits between taking price now and waiting for a normal pullback.
+//
+// every reading on a bar uses data at or before that bar. movement lines are drawn back to their pivots,
+// but a movement only exists from the bar that confirmed it, and nothing upstream sees it earlier.
+//
+// the john bot runs this exact logic in python (john_bot/shepherd.py). the validation panel here is the
+// same record the bot uses to decide whether real money is allowed.
+indicator("shepherd · movement", shorttitle = "shepherd", overlay = true, max_lines_count = 500, max_labels_count = 500, max_boxes_count = 300, max_bars_back = 1000)
+
+// ── palette ──────────────────────────────────────────────────────────────
+// blacks at different temperatures. one accent, spent only on trust states.
+// gain / loss keep the market's green / red meaning, desaturated so they never compete with the accent.
+color C_VOID   = #07080a
+color C_SURF   = #0c0e12
+color C_SHADOW = #13161b
+color C_LINE   = #252a32
+color C_DIM    = #3a414b
+color C_MUTE   = #5b636e
+color C_TEXT   = #8a929d
+color C_BRIGHT = #c2c8d0
+color C_ACCENT = #8fd3e6
+color C_GAIN   = #5e8c78
+color C_LOSS   = #8f5a62
+
+// ── inputs ───────────────────────────────────────────────────────────────
+string G1 = "segmentation"
+int   atrLen  = input.int(14, "atr length", minval = 2, group = G1, display = display.none)
+float segMult = input.float(1.5, "reversal that ends a movement (× atr)", minval = 0.2, step = 0.1, group = G1, display = display.none)
+int   win     = input.int(7, "battle window (candles)", minval = 3, maxval = 30, group = G1, display = display.none)
+
+string G2 = "interaction"
+float impulseMult = input.float(1.0, "impulse body (× atr)", minval = 0.2, step = 0.1, group = G2, display = display.none)
+int   echoWin     = input.int(5, "echo window", minval = 2, maxval = 20, group = G2, display = display.none)
+float echoNetMin  = input.float(0.25, "echo net move to count as directional (× atr)", minval = 0.0, step = 0.05, group = G2, display = display.none)
+float echoMinQual = input.float(0.2, "min echo strength", minval = 0.0, maxval = 1.0, step = 0.05, group = G2, display = display.none)
+int   echoFresh   = input.int(12, "echo stays relevant for (bars)", minval = 1, group = G2, display = display.none)
+float resolveVel  = input.float(1.2, "resolution velocity (normalized)", minval = 0.1, step = 0.1, group = G2, display = display.none)
+float conflictMax = input.float(0.35, "max conflict density at resolution", minval = 0.0, maxval = 1.0, step = 0.05, group = G2, display = display.none)
+float decayFrac   = input.float(0.5, "dominance decays below (× peak velocity)", minval = 0.1, maxval = 0.95, step = 0.05, group = G2, display = display.none)
+float probeVel    = input.float(0.6, "probe: velocity ceiling", minval = 0.05, step = 0.05, group = G2, display = display.none)
+int   probeMin    = input.int(4, "probe: min same-direction candles in window", minval = 2, group = G2, display = display.none)
+float stallVel    = input.float(0.3, "stall: velocity ceiling", minval = 0.05, step = 0.05, group = G2, display = display.none)
+float bounceVel   = input.float(0.9, "bounce: both sides' effort above", minval = 0.1, step = 0.1, group = G2, display = display.none)
+float defTol      = input.float(0.25, "defense touch tolerance (× atr)", minval = 0.0, step = 0.05, group = G2, display = display.none)
+float sweepWick   = input.float(0.55, "sweep: wick share of range", minval = 0.1, maxval = 0.95, step = 0.05, group = G2, display = display.none)
+float thinVol     = input.float(0.6, "thin terrain: window volume below (× average)", minval = 0.0, step = 0.05, group = G2, display = display.none)
+
+string G3 = "regime · normal rate"
+int   regLen  = input.int(100, "regime lookback", minval = 20, group = G3, display = display.none)
+float erTrend = input.float(0.3, "trend when efficiency ratio above", minval = 0.05, maxval = 0.95, step = 0.05, group = G3, display = display.none)
+int   normN   = input.int(40, "normal rate sample per regime (movements)", minval = 8, maxval = 200, group = G3, display = display.none)
+float tempoHi = input.float(1.5, "elongated above (× normal duration)", minval = 1.05, step = 0.05, group = G3, display = display.none)
+float tempoLo = input.float(0.67, "constricted below (× normal duration)", minval = 0.1, maxval = 0.95, step = 0.05, group = G3, display = display.none)
+
+string G4 = "pattern memory"
+int   seqK      = input.int(5, "sequence length (movements)", minval = 3, maxval = 8, group = G4, display = display.none)
+float rhythmW   = input.float(0.5, "rhythm weight vs interval", minval = 0.0, step = 0.1, group = G4, display = display.none)
+int   memMax    = input.int(400, "memory size", minval = 50, maxval = 1500, group = G4, display = display.none)
+int   knnK      = input.int(15, "neighbors", minval = 3, maxval = 60, group = G4, display = display.none)
+int   minMem    = input.int(60, "resolved memory needed before predicting", minval = 10, group = G4, display = display.none)
+float minProb   = input.float(0.56, "framework: min probability in trade direction", minval = 0.5, maxval = 0.95, step = 0.01, group = G4, display = display.none)
+float minEdge   = input.float(0.04, "framework: min edge over base rate", minval = 0.0, step = 0.01, group = G4, display = display.none)
+bool  reqPat    = input.bool(true, "framework: require pattern layer (blank = no trade)", group = G4, display = display.none)
+int   rollN     = input.int(40, "decay: rolling window (predictions)", minval = 10, group = G4, display = display.none)
+float decayTol  = input.float(0.08, "decay: rolling accuracy below lifetime by", minval = 0.0, step = 0.01, group = G4, display = display.none)
+bool  haltDecay = input.bool(true, "stand down when pattern layer degrades", group = G4, display = display.none)
+
+string G5 = "trade"
+int   resLook  = input.int(3, "entry window after resolution (bars)", minval = 0, group = G5, display = display.none)
+float chaseMax = input.float(1.0, "skip if price ran from resolution by (× atr)", minval = 0.0, step = 0.1, group = G5, display = display.none)
+float slBuf    = input.float(0.3, "stop buffer beyond defended level (× atr)", minval = 0.0, step = 0.05, group = G5, display = display.none)
+float maxStop  = input.float(3.0, "max stop distance (× atr)", minval = 0.2, step = 0.1, group = G5, display = display.none)
+float minRR    = input.float(1.5, "min reward : risk", minval = 0.1, step = 0.1, group = G5, display = display.none)
+float passExt  = input.float(0.5, "max target extension from passion", minval = 0.0, step = 0.05, group = G5, display = display.none)
+float timeMult = input.float(2.0, "time stop (× normal duration)", minval = 0.5, step = 0.1, group = G5, display = display.none)
+float costPct  = input.float(0.12, "round-trip cost: spread + fees + slippage (%)", minval = 0.0, step = 0.01, group = G5, display = display.none)
+float costMult = input.float(3.0, "target must exceed cost by", minval = 1.0, step = 0.5, group = G5, display = display.none)
+
+string G9 = "projection"
+bool  showProj    = input.bool(true, "show projection", group = G9, display = display.none)
+float projMinP    = input.float(0.56, "call when probability above", minval = 0.5, maxval = 0.95, step = 0.01, group = G9, display = display.none)
+float projMinEdge = input.float(0.03, "min edge over base rate", minval = 0.0, step = 0.01, group = G9, display = display.none)
+bool  projWinner  = input.bool(false, "require the winner to agree", group = G9, display = display.none)
+float depthQ      = input.float(0.4, "limit depth percentile (lower = shallower, fills more)", minval = 0.05, maxval = 0.9, step = 0.05, group = G9, display = display.none)
+int   waitBars    = input.int(0, "limit expires after (bars, 0 = normal duration)", minval = 0, group = G9, display = display.none)
+int   projLen     = input.int(14, "projection length (bars to the right)", minval = 4, maxval = 60, group = G9, display = display.none)
+
+string G6 = "risk · baselines"
+float acct    = input.float(10000.0, "account size", minval = 0.0, group = G6, display = display.none)
+float riskPct = input.float(0.5, "risk per trade (%)", minval = 0.01, maxval = 10, step = 0.05, group = G6, display = display.none)
+float maxDayR = input.float(3.0, "stand down after daily loss (r)", minval = 0.5, step = 0.5, group = G6, display = display.none)
+float pRand   = input.float(0.03, "random baseline: entry chance per bar", minval = 0.001, maxval = 0.5, step = 0.005, group = G6, display = display.none)
+
+string G7 = "event filter"
+bool   useBlk = input.bool(false, "blackout window (manual — pine has no news feed)", group = G7, display = display.none)
+string blkSes = input.session("0825-0845", "blackout", group = G7, display = display.none)
+string blkTz  = input.string("America/New_York", "blackout timezone", group = G7, display = display.none)
+
+string G8 = "visual"
+bool showSegs  = input.bool(true, "movement lines", group = G8, display = display.none)
+bool showMicro = input.bool(true, "probes and sweeps", group = G8, display = display.none)
+bool cinema    = input.bool(true, "cinematic candles", group = G8, display = display.none)
+bool showBg    = input.bool(true, "dominance field", group = G8, display = display.none)
+bool showHud   = input.bool(true, "reading panel", group = G8, display = display.none)
+bool showVal   = input.bool(true, "validation panel", group = G8, display = display.none)
+
+// ── types ────────────────────────────────────────────────────────────────
+type Seg
+    int   b0
+    float p0
+    int   b1
+    float p1
+    int   dir
+    int   dur
+    float mag
+    int   reg
+
+type Bucket
+    array<float> dur
+    array<float> mag
+
+type Mem
+    array<float> iv
+    array<float> rh
+    int   dir
+    float contLvl
+    float failLvl
+    int   outcome
+    float pred
+    int   born
+
+type Engine
+    string name
+    int    dir     = 0
+    float  entry   = na
+    float  sl      = na
+    float  tp      = na
+    float  risk    = na
+    int    bar0    = na
+    int    maxBars = na
+    int    trades  = 0
+    int    wins    = 0
+    float  sumR    = 0.0
+    float  dayR    = 0.0
+    box    riskBox = na
+    box    rewBox  = na
+
+// ── helpers ──────────────────────────────────────────────────────────────
+f_n(float x, string f) => na(x) ? "—" : str.tostring(x, f)
+f_arrow(int dd) => dd == 1 ? "↑" : dd == -1 ? "↓" : "·"
+f_tempo(float x) => na(x) ? "—" : x > tempoHi ? "elongated" : x < tempoLo ? "constricted" : "normal"
+
+// two movement sequences compared like melodies: intervals are amplitude-normalized and rhythm is
+// log-duration minus its own mean, so the same shape played louder, faster or slower lands close.
+// the band keeps the warp to one step — tempo is already normalized, wider warps just smear identity.
+f_dtw(array<float> a1, array<float> r1, array<float> a2, array<float> r2, float wR) =>
+    int n = a1.size()
+    matrix<float> D = matrix.new<float>(n + 1, n + 1, 1e10)
+    D.set(0, 0, 0.0)
+    for i = 1 to n
+        for j = math.max(1, i - 1) to math.min(n, i + 1)
+            float c = math.abs(a1.get(i - 1) - a2.get(j - 1)) + wR * math.abs(r1.get(i - 1) - r2.get(j - 1))
+            D.set(i, j, c + math.min(D.get(i - 1, j), D.get(i, j - 1), D.get(i - 1, j - 1)))
+    D.get(n, n)
+
+// ── core series ──────────────────────────────────────────────────────────
+float atr    = ta.atr(atrLen)
+float body   = close - open
+float absB   = math.abs(body)
+float rng    = high - low
+float sqW    = math.sqrt(win)
+float upB    = math.sum(body > 0 ? body : 0.0, win)
+float dnB    = math.sum(body < 0 ? -body : 0.0, win)
+// displacement over √n, not n: random movement grows with the square root of time,
+// so this reads as "how far past what noise would do"
+float nvWin  = (close - close[win]) / (atr * sqW)
+float absNv  = math.abs(nvWin)
+int   dirWin = nvWin > 0 ? 1 : nvWin < 0 ? -1 : 0
+float effUp  = upB / (atr * sqW)
+float effDn  = dnB / (atr * sqW)
+float totB   = upB + dnB
+float conflict = totB > 0 ? (dirWin == 1 ? dnB : dirWin == -1 ? upB : math.min(upB, dnB)) / totB : 0.0
+int   upCnt  = int(math.sum(close > open ? 1 : 0, win))
+int   dnCnt  = int(math.sum(close < open ? 1 : 0, win))
+
+float vol     = nz(volume)
+float volMa   = ta.sma(vol, 20)
+float volW    = math.sum(vol, win)
+bool  hasVol  = nz(volMa) > 0
+float relVolW = hasVol ? volW / (volMa * win) : 1.0
+// velocity through empty terrain isn't a win — nobody was fighting
+bool  thin    = hasVol and relVolW < thinVol
+
+float pathLen = math.sum(math.abs(close - close[1]), regLen)
+float er      = nz(pathLen) > 0 ? math.abs(close - close[regLen]) / pathLen : 0.0
+float atrMa   = ta.sma(atr, regLen)
+int   reg     = (er >= erTrend ? 2 : 0) + (atr >= atrMa ? 1 : 0)
+var array<string> REG = array.from("range · low vol", "range · high vol", "trend · low vol", "trend · high vol")
+
+float costFrac = costPct / 100.0
+bool  inBlk    = useBlk and not na(time(timeframe.period, blkSes, blkTz))
+bool  newDay   = nz(ta.change(time("D"))) != 0
+bool  ready    = not na(atr) and not na(atrMa) and not na(close[regLen]) and atr > 0
+
+bool  momLong  = ta.crossover(nvWin, resolveVel)
+bool  momShort = ta.crossunder(nvWin, -resolveVel)
+float rv       = math.random(0.0, 1.0, 42)
+float rdv      = math.random(0.0, 1.0, 1337)
+
+// ── segmentation (real time, no lookahead) ───────────────────────────────
+var int   segDir    = 0
+var float sP0       = na
+var int   sB0       = na
+var float xP        = na
+var int   xB        = na
+var float swingLo   = na
+var float swingHi   = na
+var float lastTempo = na
+var float lastAmp   = na
+var array<Seg>    segs    = array.new<Seg>()
+var array<Bucket> buckets = array.new<Bucket>()
+// each movement's size relative to the one before it: the chart's own record of how deep pullbacks run
+var array<float>  retr    = array.new<float>()
+if barstate.isfirst
+    for i = 0 to 3
+        buckets.push(Bucket.new(array.new<float>(), array.new<float>()))
+
+// sweeps read the swing levels as they stood before this bar touched them
+bool sweepLow  = ready and not na(swingLo) and low < swingLo and close > swingLo and (math.min(open, close) - low) >= sweepWick * rng
+bool sweepHigh = ready and not na(swingHi) and high > swingHi and close < swingHi and (high - math.max(open, close)) >= sweepWick * rng
+
+bool segNew  = false
+Seg  segLast = na
+if ready
+    if segDir == 0
+        segDir := close >= open ? 1 : -1
+        sP0 := segDir == 1 ? low : high
+        sB0 := bar_index
+        xP  := segDir == 1 ? high : low
+        xB  := bar_index
+    else
+        bool extends = segDir == 1 ? high > xP : low < xP
+        if extends
+            xP := segDir == 1 ? high : low
+            xB := bar_index
+        else if (segDir == 1 ? xP - low : high - xP) >= segMult * atr
+            int   sd  = math.max(xB - sB0, 1)
+            float sm  = math.abs(xP - sP0) / atr
+            Bucket sbk = buckets.get(reg)
+            float nd0 = sbk.dur.size() >= 8 ? sbk.dur.median() : na
+            float nm0 = sbk.mag.size() >= 8 ? sbk.mag.median() : na
+            lastTempo := sd / nd0
+            lastAmp   := sm / nm0
+            if segs.size() > 0
+                Seg sPrev = segs.last()
+                float prevRange = math.abs(sPrev.p1 - sPrev.p0)
+                if prevRange > 0
+                    retr.push(math.abs(xP - sP0) / prevRange)
+                    if retr.size() > 150
+                        retr.shift()
+            segLast := Seg.new(sB0, sP0, xB, xP, segDir, sd, sm, reg)
+            segs.push(segLast)
+            if segs.size() > 80
+                segs.shift()
+            sbk.dur.push(float(sd))
+            sbk.mag.push(sm)
+            if sbk.dur.size() > normN
+                sbk.dur.shift()
+                sbk.mag.shift()
+            if segDir == 1
+                swingLo := sP0
+                swingHi := xP
+            else
+                swingHi := sP0
+                swingLo := xP
+            segNew := true
+            sP0    := xP
+            sB0    := xB
+            segDir := -segDir
+            xP     := segDir == 1 ? high : low
+            xB     := bar_index
+
+// ── normal rate (belongs to the regime, pooled only while the regime is thin) ─
+float  nDur = na
+float  nMag = na
+string nSrc = "—"
+if ready
+    Bucket nbk = buckets.get(reg)
+    if nbk.dur.size() >= 8
+        nDur := nbk.dur.median()
+        nMag := nbk.mag.median()
+        nSrc := "regime"
+    else if segs.size() >= 8
+        array<float> pd = array.new<float>()
+        array<float> pm = array.new<float>()
+        for s in segs
+            pd.push(float(s.dur))
+            pm.push(s.mag)
+        nDur := pd.median()
+        nMag := pm.median()
+        nSrc := "pooled"
+float liveTempo = ready and nDur > 0 ? (bar_index - sB0) / nDur : na
+
+// ── defense ──────────────────────────────────────────────────────────────
+// the level a long must hold is the low that launched the current up leg; otherwise the last swing low
+float defLong  = segDir == 1 ? sP0 : swingLo
+float defShort = segDir == -1 ? sP0 : swingHi
+bool  touchL   = ready and not na(defLong) and low <= defLong + defTol * atr and close > defLong
+bool  touchS   = ready and not na(defShort) and high >= defShort - defTol * atr and close < defShort
+int   defL     = int(math.sum(touchL ? 1 : 0, win))
+int   defS     = int(math.sum(touchS ? 1 : 0, win))
+
+// ── echo ─────────────────────────────────────────────────────────────────
+var int   eDir     = 0
+var int   eBar     = na
+var float eClose   = na
+var int   eSame    = 0
+var int   eCounter = 0
+var int   eRun     = 0
+var bool  eRunOpen = false
+var int   eLat     = na
+var int   echoDir  = 0
+var float echoQual = na
+var int   echoRun  = 0
+var int   echoLat  = na
+var float echoNet  = na
+var int   echoBar  = na
+
+bool isImpulse = ready and absB >= impulseMult * atr and absB >= 0.6 * rng
+if ready
+    if eDir != 0
+        int ek = bar_index - eBar
+        int cd = body > 0 ? 1 : body < 0 ? -1 : 0
+        if cd == eDir
+            eSame += 1
+            if eRunOpen
+                eRun += 1
+            if na(eLat) and absB >= 0.25 * atr
+                eLat := ek
+        else
+            eRunOpen := false
+            if cd == -eDir
+                eCounter += 1
+        if ek >= echoWin
+            echoNet  := (close - eClose) / atr * eDir
+            echoQual := float(eSame - eCounter) / echoWin
+            // an echo that runs against its impulse is still an echo: it names the other side as winner
+            echoDir  := echoNet >= echoNetMin and echoQual > 0 ? eDir : echoNet <= -echoNetMin and echoQual < 0 ? -eDir : 0
+            echoRun  := eRun
+            echoLat  := eLat
+            echoBar  := bar_index
+            eDir     := 0
+    if eDir == 0 and isImpulse
+        eDir     := body > 0 ? 1 : -1
+        eBar     := bar_index
+        eClose   := close
+        eSame    := 0
+        eCounter := 0
+        eRun     := 0
+        eRunOpen := true
+        eLat     := na
+
+// ── war · resolution · state ─────────────────────────────────────────────
+var int   domDir   = 0
+var float domPeak  = 0.0
+var int   resBar   = na
+var float resPrice = na
+bool resNow = false
+bool bounce = ready and effUp >= bounceVel and effDn >= bounceVel and absNv < resolveVel
+if ready
+    bool resolves = absNv >= resolveVel and conflict <= conflictMax and not thin and dirWin != 0
+    if resolves and domDir != dirWin
+        domDir   := dirWin
+        domPeak  := absNv
+        resBar   := bar_index
+        resPrice := close
+        resNow   := true
+    else if domDir != 0
+        if dirWin == domDir
+            domPeak := math.max(domPeak, absNv)
+        else if (dirWin == -domDir and absNv >= stallVel) or bounce
+            domDir  := 0
+            domPeak := 0.0
+
+// 0 stall · 1 probe↑ · 2 probe↓ · 3 war · 4 bounce · 5 dominance↑ · 6 dominance↓ · 7 decay↑ · 8 decay↓
+// stall and probe are kept apart: a stall makes no attempt, a probe keeps attempting without velocity
+int st = 0
+if ready
+    if domDir != 0
+        st := absNv < decayFrac * domPeak ? (domDir == 1 ? 7 : 8) : (domDir == 1 ? 5 : 6)
+    else if bounce
+        st := 4
+    else if absNv < probeVel and upCnt >= probeMin and upCnt > dnCnt
+        st := 1
+    else if absNv < probeVel and dnCnt >= probeMin and dnCnt > upCnt
+        st := 2
+    else if absNv < stallVel
+        st := 0
+    else
+        st := 3
+var array<string> STATE = array.from("stall", "probe ↑", "probe ↓", "war", "bounce", "dominance ↑", "dominance ↓", "decay ↑", "decay ↓")
+
+// ── precursor test: does probing raise the odds of resolution, or is it memory bias ─
+int  H         = win
+int  upRes     = int(math.sum(resNow and domDir == 1 ? 1 : 0, H))
+int  dnRes     = int(math.sum(resNow and domDir == -1 ? 1 : 0, H))
+int  probeThen = st[H] == 1 ? 1 : st[H] == 2 ? -1 : 0
+bool readyThen = ready[H]
+var int pcN   = 0
+var int pcHit = 0
+var int bsN   = 0
+var int bsHit = 0
+if ready and readyThen and barstate.isconfirmed
+    bsN   += 2
+    bsHit += (upRes > 0 ? 1 : 0) + (dnRes > 0 ? 1 : 0)
+    if probeThen != 0
+        pcN   += 1
+        pcHit += (probeThen == 1 ? upRes : dnRes) > 0 ? 1 : 0
+
+// ── pattern memory ───────────────────────────────────────────────────────
+// outcome is continuation (breaks the movement's end first) or reversal (breaks its start first).
+// sequences are mirrored so the last movement always points up — up and down shapes share memory.
+var array<Mem> mem     = array.new<Mem>()
+var array<Mem> pending = array.new<Mem>()
+var float pCont       = na
+var float baseCont    = na
+var int   memResolved = 0
+var float matchQ      = na
+var int   lastSegDir  = 0
+var array<int> calN    = array.new<int>(5, 0)
+var array<int> calHit  = array.new<int>(5, 0)
+var array<int> accRoll = array.new<int>()
+var int accN   = 0
+var int accHit = 0
+
+if ready and pending.size() > 0
+    for i = pending.size() - 1 to 0
+        Mem pm0 = pending.get(i)
+        if bar_index > pm0.born
+            bool cont = pm0.dir == 1 ? high > pm0.contLvl : low < pm0.contLvl
+            bool fail = pm0.dir == 1 ? low < pm0.failLvl : high > pm0.failLvl
+            if cont and fail
+                // both levels inside one candle: the order is unknowable from bars, so it is discarded
+                pm0.outcome := -2
+            else if cont or fail
+                pm0.outcome := cont ? 1 : 0
+                if not na(pm0.pred)
+                    int cb = math.min(int(pm0.pred * 5), 4)
+                    calN.set(cb, calN.get(cb) + 1)
+                    calHit.set(cb, calHit.get(cb) + pm0.outcome)
+                    int hit = (pm0.pred >= 0.5) == (pm0.outcome == 1) ? 1 : 0
+                    accN   += 1
+                    accHit += hit
+                    accRoll.push(hit)
+                    if accRoll.size() > rollN
+                        accRoll.shift()
+            if pm0.outcome != -1
+                pending.remove(i)
+
+if segNew and segs.size() >= seqK
+    array<float> iv = array.new<float>()
+    array<float> rh = array.new<float>()
+    int   n0    = segs.size() - seqK
+    float sumM  = 0.0
+    float sumLD = 0.0
+    for i = n0 to segs.size() - 1
+        Seg s1 = segs.get(i)
+        sumM  += s1.mag
+        sumLD += math.log(s1.dur)
+    float meanM  = sumM / seqK
+    float meanLD = sumLD / seqK
+    for i = n0 to segs.size() - 1
+        Seg s2 = segs.get(i)
+        iv.push(segLast.dir * s2.dir * s2.mag / meanM)
+        rh.push(math.log(s2.dur) - meanLD)
+    array<float> dists = array.new<float>()
+    array<int>   outs  = array.new<int>()
+    int contAll = 0
+    for mm in mem
+        if mm.outcome >= 0 and mm.iv.size() == seqK
+            dists.push(f_dtw(iv, rh, mm.iv, mm.rh, rhythmW))
+            outs.push(mm.outcome)
+            contAll += mm.outcome
+    memResolved := outs.size()
+    baseCont := memResolved > 0 ? float(contAll) / memResolved : na
+    float pNow = na
+    if memResolved >= minMem
+        array<int> idxs = dists.sort_indices(order.ascending)
+        int   kk   = math.min(knnK, memResolved)
+        int   hits = 0
+        float dSum = 0.0
+        for j = 0 to kk - 1
+            int ix = idxs.get(j)
+            hits += outs.get(ix)
+            dSum += dists.get(ix)
+        // shrunk toward the base rate: k neighbors alone overstate confidence
+        pNow   := (hits + 2.0 * baseCont) / (kk + 2.0)
+        matchQ := (dSum / kk) / math.max(dists.median(), 1e-9)
+    pCont      := pNow
+    lastSegDir := segLast.dir
+    Mem nm = Mem.new(iv, rh, segLast.dir, segLast.p1, segLast.p0, -1, pNow, bar_index)
+    mem.push(nm)
+    pending.push(nm)
+    if mem.size() > memMax
+        mem.shift()
+
+float accLife  = accN > 0 ? float(accHit) / accN : na
+float accRollV = accRoll.size() > 0 ? float(accRoll.sum()) / accRoll.size() : na
+bool  decayed  = accRoll.size() >= rollN and accRollV < accLife - decayTol
+
+float pDir  = na
+float edgeV = na
+if not na(pCont) and domDir != 0
+    pDir  := lastSegDir == domDir ? pCont : 1.0 - pCont
+    edgeV := pDir - (lastSegDir == domDir ? baseCont : 1.0 - baseCont)
+
+// ── passion (kept as a vector; the index only stretches the target and is unvalidated) ─
+float persist    = domDir != 0 and segDir == domDir and nDur > 0 ? (bar_index - sB0) / nDur : 0.0
+int   defDom     = domDir == 1 ? defL : domDir == -1 ? defS : 0
+float echoS      = domDir != 0 and echoDir == domDir ? math.abs(nz(echoQual)) : 0.0
+float latS       = domDir != 0 and echoDir == domDir and not na(echoLat) ? math.max(0.0, 1.0 - (echoLat - 1.0) / echoWin) : 0.0
+float passionIdx = (math.min(persist, 1.0) + math.min(defDom / 3.0, 1.0) + math.min(echoS, 1.0) + latS) / 4.0
+
+// ── projection ───────────────────────────────────────────────────────────
+// the limit sits at a normal pullback depth for this chart; fill odds come from how often pullbacks that
+// already went this deep kept going to the limit. p is assumed equal for both entries — deeper fills
+// likely win a little less often, so if anything the wait side is flattered.
+float pUp = na
+float bUp = na
+if not na(pCont) and not na(baseCont)
+    pUp := lastSegDir == 1 ? pCont : 1.0 - pCont
+    bUp := lastSegDir == 1 ? baseCont : 1.0 - baseCont
+int pjCall = 0
+if ready and not na(pUp)
+    if pUp >= projMinP and pUp - bUp >= projMinEdge
+        pjCall := 1
+    else if pUp <= 1.0 - projMinP and bUp - pUp >= projMinEdge
+        pjCall := -1
+    if projWinner and pjCall != 0 and domDir != pjCall
+        pjCall := 0
+
+float  pjP    = na
+float  pjSl   = na
+float  pjLim  = na
+float  pjFill = na
+float  pjTgt  = na
+float  pjEvN  = na
+float  pjEvW  = na
+float  pjWNow = na
+float  pjEnt  = na
+float  pjTp   = na
+float  pjRR   = na
+float  pjEv   = na
+string pjMode = ""
+string pjMsg  = ""
+if pjCall != 0 and not na(nMag)
+    int pdr = pjCall
+    pjP := pdr == 1 ? pUp : 1.0 - pUp
+    float legA = segDir == pdr ? sP0 : (pdr == 1 ? swingLo : swingHi)
+    float legB = segDir == pdr ? xP : sP0
+    float leg  = na(legA) or na(legB) ? 0.0 : math.abs(legB - legA)
+    float curR = segDir == pdr or leg <= 0 ? 0.0 : math.abs(xP - sP0) / leg
+    float lvl  = pdr == 1 ? defLong : defShort
+    pjSl  := na(lvl) ? na : lvl - pdr * slBuf * atr
+    pjTgt := nMag * (1.0 + (domDir == pdr ? passExt * passionIdx : 0.0)) * atr
+    float rN = na(pjSl) ? na : (close - pjSl) * pdr
+    if not na(rN) and rN > 0 and rN <= maxStop * atr
+        pjEvN := pjP * pjTgt / rN - (1.0 - pjP) - costFrac * close / rN
+    if retr.size() >= 20 and leg > 0 and not na(pjSl)
+        float v = math.min(retr.percentile_linear_interpolation(depthQ * 100.0), 0.9)
+        if curR < v
+            float lim = legB - pdr * v * leg
+            float rW  = (lim - pjSl) * pdr
+            if (close - lim) * pdr > 0 and rW > 0
+                int nV = 0
+                int nC = 0
+                for x in retr
+                    nV += x >= v ? 1 : 0
+                    nC += x >= curR ? 1 : 0
+                pjFill := nC > 0 ? float(nV) / nC : na
+                if not na(pjFill)
+                    pjLim := lim
+                    pjEvW := pjFill * (pjP * pjTgt / rW - (1.0 - pjP) - costFrac * lim / rW)
+    float eN = math.max(nz(pjEvN), 0.0)
+    float eW = math.max(nz(pjEvW), 0.0)
+    if na(pjSl)
+        pjMsg := "no defended level"
+    else if eN + eW <= 0
+        pjMsg := "no edge after costs"
+    else
+        pjWNow := eN / (eN + eW)
+        pjEnt  := na(pjLim) ? close : pjWNow * close + (1.0 - pjWNow) * pjLim
+        pjTp   := pjEnt + pdr * pjTgt
+        pjRR   := pjTgt / ((pjEnt - pjSl) * pdr)
+        pjEv   := pjWNow * eN + (1.0 - pjWNow) * eW
+        pjMode := pjWNow >= 0.8 ? "enter now" : pjWNow <= 0.2 ? "wait for " + str.tostring(pjLim, format.mintick) : "split"
+
+// ── engines ──────────────────────────────────────────────────────────────
+// stop comes from structure (the defended level), target from the regime's normal rate.
+// passion only stretches the target — a clear defended level is what earns the tight stop.
+f_plan(int pd0, float ext) =>
+    float lvl  = pd0 == 1 ? defLong : defShort
+    float slv  = na(lvl) ? na : lvl - pd0 * slBuf * atr
+    float rsk  = na(slv) ? na : (close - slv) * pd0
+    float tgt  = na(nMag) ? na : nMag * (1.0 + ext) * atr
+    float tpv  = na(tgt) ? na : close + pd0 * tgt
+    string msg = na(slv) ? "no defended level" : rsk <= 0 ? "defended level broken" : rsk > maxStop * atr ? "stop too wide" : na(tgt) ? "normal rate unknown" : tgt < costMult * costFrac * close ? "target inside cost" : tgt / rsk < minRR ? "reward : risk low" : ""
+    [msg, slv, tpv, rsk]
+
+f_record(Engine e, float r) =>
+    e.trades := e.trades + 1
+    e.wins   := e.wins + (r > 0 ? 1 : 0)
+    e.sumR   := e.sumR + r
+    e.dayR   := e.dayR + r
+    e.dir    := 0
+    r
+
+f_step(Engine e) =>
+    int   code = 0
+    float r    = na
+    if e.dir != 0 and bar_index > e.bar0
+        float costR = costFrac * e.entry / e.risk
+        bool slGap = e.dir == 1 ? open <= e.sl : open >= e.sl
+        bool tpGap = e.dir == 1 ? open >= e.tp : open <= e.tp
+        bool slHit = e.dir == 1 ? low <= e.sl : high >= e.sl
+        bool tpHit = e.dir == 1 ? high >= e.tp : low <= e.tp
+        if slGap or tpGap
+            r    := (open - e.entry) * e.dir / e.risk - costR
+            code := slGap ? -1 : 1
+        else if slHit
+            // stop and target in one candle: order unknown inside the bar, assume the stop
+            r    := (e.sl - e.entry) * e.dir / e.risk - costR
+            code := -1
+        else if tpHit
+            r    := (e.tp - e.entry) * e.dir / e.risk - costR
+            code := 1
+        else if bar_index - e.bar0 >= e.maxBars
+            r    := (close - e.entry) * e.dir / e.risk - costR
+            code := 2
+        if code != 0
+            f_record(e, r)
+    [code, r]
+
+f_openAt(Engine e, int od, float px, float oslv, float otpv, int maxB) =>
+    e.dir     := od
+    e.entry   := px
+    e.sl      := oslv
+    e.tp      := otpv
+    e.risk    := math.abs(px - oslv)
+    e.bar0    := bar_index
+    e.maxBars := maxB
+    e.risk
+
+var Engine fw = Engine.new("framework")
+var Engine pj = Engine.new("projection")
+var Engine mo = Engine.new("momentum")
+var Engine rn = Engine.new("random")
+var float  bh0    = na
+var float  fwSize = na
+
+if newDay
+    fw.dayR := 0.0
+    pj.dayR := 0.0
+    mo.dayR := 0.0
+    rn.dayR := 0.0
+if ready and na(bh0)
+    bh0 := close
+
+int fwPrevDir = fw.dir
+[fwCode, fwR] = f_step(fw)
+[pjCode, pjR] = f_step(pj)
+[moCode, moR] = f_step(mo)
+[rnCode, rnR] = f_step(rn)
+
+int mb = na(nDur) ? 20 : math.min(math.max(int(math.round(nDur * timeMult)), 3), 400)
+
+// projection engine: takes the majority side of the weighted plan when a new call appears
+var int   pendDir = 0
+var float pendPx  = na
+var float pendSl  = na
+var float pendTp  = na
+var int   pendExp = na
+if ready and pendDir != 0 and pj.dir == 0
+    bool touched = pendDir == 1 ? low <= pendPx : high >= pendPx
+    bool gapped  = pendDir == 1 ? open <= pendPx : open >= pendPx
+    bool pastSl  = pendDir == 1 ? open <= pendSl : open >= pendSl
+    if pastSl
+        pendDir := 0
+    else if touched
+        f_openAt(pj, pendDir, gapped ? open : pendPx, pendSl, pendTp, mb)
+        pendDir := 0
+        // filled and stopped inside the same candle: bars can't show the order, so the stop counts
+        bool stopSame = pj.dir == 1 ? low <= pj.sl : high >= pj.sl
+        if stopSame
+            f_record(pj, (pj.sl - pj.entry) * pj.dir / pj.risk - costFrac * pj.entry / pj.risk)
+    else if bar_index >= pendExp or pjCall != pendDir
+        pendDir := 0
+
+bool pjNew = pjCall != 0 and pjCall != pjCall[1]
+if ready and barstate.isconfirmed and pjNew and pj.dir == 0 and pendDir == 0 and not na(pjWNow)
+    if pjWNow >= 0.5
+        f_openAt(pj, pjCall, close, pjSl, close + pjCall * pjTgt, mb)
+    else if not na(pjLim)
+        pendDir := pjCall
+        pendPx  := pjLim
+        pendSl  := pjSl
+        pendTp  := pjLim + pjCall * pjTgt
+        pendExp := bar_index + (waitBars > 0 ? waitBars : mb)
+
+string why        = "warming up"
+bool   fwLongNow  = false
+bool   fwShortNow = false
+if ready
+    int d = domDir
+    if fw.dir != 0
+        why := "in trade"
+    else if fw.dayR <= -maxDayR
+        why := "stood down · daily loss"
+    else if inBlk
+        why := "blackout window"
+    else if d == 0
+        why := "no winner yet"
+    else if bar_index - resBar > resLook
+        why := "resolution stale"
+    else if (close - resPrice) * d > chaseMax * atr
+        why := "chasing"
+    else if echoDir == 0 or na(echoBar) or bar_index - echoBar > echoFresh
+        why := "echo unclear"
+    else if echoDir != d
+        why := "echo against winner"
+    else if math.abs(echoQual) < echoMinQual
+        why := "echo faint"
+    else if reqPat and na(pDir)
+        why := "pattern memory blank"
+    else if reqPat and (pDir < minProb or edgeV < minEdge)
+        why := "pattern edge thin"
+    else if haltDecay and decayed
+        why := "pattern layer degraded"
+    else
+        [pw, slv, tpv, rk] = f_plan(d, passExt * passionIdx)
+        why := pw
+        if pw == "" and barstate.isconfirmed
+            f_openAt(fw, d, close, slv, tpv, mb)
+            fwSize     := acct * riskPct / 100.0 / rk
+            fwLongNow  := d == 1
+            fwShortNow := d == -1
+            float lo = math.min(fw.entry, fw.sl)
+            float hi = math.max(fw.entry, fw.sl)
+            fw.riskBox := box.new(bar_index, hi, bar_index + mb, lo, border_color = color(na), bgcolor = color.new(C_LOSS, 85))
+            fw.rewBox  := box.new(bar_index, math.max(fw.entry, fw.tp), bar_index + mb, math.min(fw.entry, fw.tp), border_color = color(na), bgcolor = color.new(C_ACCENT, 88))
+            string etxt = (d == 1 ? "long" : "short") + "  p " + f_n(pDir, "#.00") + "  rr " + f_n(math.abs(tpv - close) / rk, "#.0") + "  size " + f_n(fwSize, "#.####")
+            label.new(bar_index, d == 1 ? low - 0.8 * atr : high + 0.8 * atr, etxt, style = label.style_none, textcolor = C_ACCENT, size = size.tiny, text_font_family = font.family_monospace)
+            alert("shepherd · " + etxt, alert.freq_once_per_bar_close)
+
+    // baselines share the same exits; if the framework can't beat them, the edge lives in the exit, not the read
+    if mo.dir == 0 and barstate.isconfirmed and (momLong or momShort)
+        int md = momLong ? 1 : -1
+        [mw, mslv, mtpv, mrk] = f_plan(md, 0.0)
+        if mw == ""
+            f_openAt(mo, md, close, mslv, mtpv, mb)
+    if rn.dir == 0 and barstate.isconfirmed and rv < pRand
+        int rd = rdv < 0.5 ? 1 : -1
+        [rw, rslv, rtpv, rrk] = f_plan(rd, 0.0)
+        if rw == ""
+            f_openAt(rn, rd, close, rslv, rtpv, mb)
+
+if fwCode != 0
+    if not na(fw.riskBox)
+        box.set_right(fw.riskBox, bar_index)
+        box.set_right(fw.rewBox, bar_index)
+    string xt = (fwCode == 1 ? "target " : fwCode == -1 ? "stop " : "time ") + str.tostring(fwR, "+#.00;-#.00") + "r"
+    label.new(bar_index, fwPrevDir == 1 ? high + 0.5 * atr : low - 0.5 * atr, xt, style = label.style_none, textcolor = fwR > 0 ? C_GAIN : C_LOSS, size = size.tiny, text_font_family = font.family_monospace)
+
+// ── drawing ──────────────────────────────────────────────────────────────
+if segNew and showSegs
+    line.new(segLast.b0, segLast.p0, segLast.b1, segLast.p1, color = C_DIM, width = 1)
+
+var line  liveLn = na
+var line  defLn  = na
+var label defLb  = na
+if barstate.islast and ready
+    line.delete(liveLn)
+    line.delete(defLn)
+    label.delete(defLb)
+    if showSegs
+        liveLn := line.new(sB0, sP0, xB, xP, color = C_LINE, width = 1, style = line.style_dotted)
+    float dl = domDir == 1 ? defLong : domDir == -1 ? defShort : na
+    if not na(dl)
+        defLn := line.new(bar_index - win, dl, bar_index + 6, dl, color = C_MUTE, width = 1, style = line.style_dashed)
+        defLb := label.new(bar_index + 6, dl, "defended", style = label.style_none, textcolor = C_MUTE, size = size.tiny, text_font_family = font.family_monospace)
+
+// projection drawn into the empty space right of the last candle
+var array<line>  pjLines  = array.new<line>()
+var array<label> pjLabels = array.new<label>()
+var array<box>   pjBoxes  = array.new<box>()
+if barstate.islast
+    while pjLines.size() > 0
+        line.delete(pjLines.pop())
+    while pjLabels.size() > 0
+        label.delete(pjLabels.pop())
+    while pjBoxes.size() > 0
+        box.delete(pjBoxes.pop())
+    if showProj and ready
+        int   x0 = bar_index + 2
+        int   x1 = bar_index + projLen
+        color tr = color.new(C_VOID, 100)
+        if pjCall == 0 or pjMsg != "" or na(pjEnt)
+            string nt = pjCall == 0 ? "projection · no call   p↑ " + f_n(pUp, "0.00") + "  base " + f_n(bUp, "0.00") : "projection · " + (pjCall == 1 ? "long" : "short") + " · " + (pjMsg != "" ? pjMsg : "no plan")
+            pjLabels.push(label.new(x0, close, nt, style = label.style_label_left, color = tr, textcolor = C_MUTE, size = size.small, text_font_family = font.family_monospace))
+        else
+            int   pdr  = pjCall
+            float bDir = pdr == 1 ? bUp : 1.0 - bUp
+            pjBoxes.push(box.new(x0, math.max(pjEnt, pjSl), x1, math.min(pjEnt, pjSl), border_color = color(na), bgcolor = color.new(C_LOSS, 88)))
+            pjBoxes.push(box.new(x0, math.max(pjEnt, pjTp), x1, math.min(pjEnt, pjTp), border_color = color(na), bgcolor = color.new(C_ACCENT, 90)))
+            pjLines.push(line.new(x0, pjEnt, x1, pjEnt, color = C_ACCENT, width = 2))
+            pjLines.push(line.new(x0, pjSl, x1, pjSl, color = C_LOSS, width = 1))
+            pjLines.push(line.new(x0, pjTp, x1, pjTp, color = C_GAIN, width = 1))
+            pjLabels.push(label.new(x1, pjEnt, "weighted " + str.tostring(pjEnt, format.mintick) + "   " + f_n(100.0 * pjWNow, "0") + "% now · " + f_n(100.0 * (1.0 - pjWNow), "0") + "% limit", style = label.style_label_left, color = tr, textcolor = C_ACCENT, size = size.small, text_font_family = font.family_monospace))
+            pjLabels.push(label.new(x1, pjSl, "stop " + str.tostring(pjSl, format.mintick) + "   −1r", style = label.style_label_left, color = tr, textcolor = C_LOSS, size = size.small, text_font_family = font.family_monospace))
+            pjLabels.push(label.new(x1, pjTp, "target " + str.tostring(pjTp, format.mintick) + "   +" + f_n(pjRR, "0.0") + "r", style = label.style_label_left, color = tr, textcolor = C_GAIN, size = size.small, text_font_family = font.family_monospace))
+            if pjWNow > 0.0 and pjWNow < 1.0
+                pjLines.push(line.new(bar_index, close, x1, close, color = C_MUTE, width = 1, style = line.style_dotted))
+                pjLabels.push(label.new(x1, close, "now " + str.tostring(close, format.mintick), style = label.style_label_left, color = tr, textcolor = C_MUTE, size = size.small, text_font_family = font.family_monospace))
+            if pjWNow < 1.0 and not na(pjLim)
+                pjLines.push(line.new(x0, pjLim, x1, pjLim, color = C_TEXT, width = 1, style = line.style_dashed))
+                pjLabels.push(label.new(x1, pjLim, "limit " + str.tostring(pjLim, format.mintick) + "   fill ~" + f_n(100.0 * pjFill, "0") + "%", style = label.style_label_left, color = tr, textcolor = C_TEXT, size = size.small, text_font_family = font.family_monospace))
+            float top = math.max(pjTp, pjSl, pjEnt) + 0.4 * atr
+            float bot = math.min(pjTp, pjSl, pjEnt) - 0.4 * atr
+            string head = (pdr == 1 ? "long" : "short") + "   p " + f_n(pjP, "0.00") + "   edge " + f_n(pjP - bDir, "+0.00;-0.00") + "   ev " + f_n(pjEv, "+0.00;-0.00") + "r   " + pjMode
+            pjLabels.push(label.new(x0, pdr == 1 ? top : bot, head, style = pdr == 1 ? label.style_label_lower_left : label.style_label_upper_left, color = tr, textcolor = C_ACCENT, size = size.small, text_font_family = font.family_monospace))
+
+bool  domBar = (st == 5 or st == 6) and body * domDir > 0
+color bc     = na
+if cinema and ready
+    bc := domBar ? color.new(C_ACCENT, 20) : close >= open ? C_MUTE : C_DIM
+barcolor(bc)
+bgcolor(showBg and (st == 5 or st == 6) ? color.new(C_ACCENT, 96) : na)
+
+bool pjFlipL = showProj and ready and pjCall == 1 and pjCall[1] != 1
+bool pjFlipS = showProj and ready and pjCall == -1 and pjCall[1] != -1
+plotshape(fwLongNow, "long", shape.triangleup, location.belowbar, C_ACCENT, size = size.tiny, display = display.pane)
+plotshape(fwShortNow, "short", shape.triangledown, location.abovebar, C_ACCENT, size = size.tiny, display = display.pane)
+plotshape(pjFlipL, "projection long", shape.arrowup, location.belowbar, color.new(C_ACCENT, 55), size = size.tiny, display = display.pane)
+plotshape(pjFlipS, "projection short", shape.arrowdown, location.abovebar, color.new(C_ACCENT, 55), size = size.tiny, display = display.pane)
+plotshape(showMicro and sweepLow, "sweep low", shape.circle, location.belowbar, C_MUTE, size = size.tiny, display = display.pane)
+plotshape(showMicro and sweepHigh, "sweep high", shape.circle, location.abovebar, C_MUTE, size = size.tiny, display = display.pane)
+plotchar(showMicro and st == 1, "probe up", "·", location.belowbar, C_DIM, size = size.tiny, display = display.pane)
+plotchar(showMicro and st == 2, "probe down", "·", location.abovebar, C_DIM, size = size.tiny, display = display.pane)
+
+alertcondition(fwLongNow, "shepherd long", "shepherd · long")
+alertcondition(fwShortNow, "shepherd short", "shepherd · short")
+alertcondition(pjFlipL, "shepherd projection long", "shepherd · projection long")
+alertcondition(pjFlipS, "shepherd projection short", "shepherd · projection short")
+
+// ── panels ───────────────────────────────────────────────────────────────
+f_cell(table tb, int c, int rr, string s, color tc) =>
+    table.cell(tb, c, rr, s, text_color = tc, text_size = size.small, text_halign = c == 0 ? text.align_left : text.align_right, text_font_family = font.family_monospace, bgcolor = C_VOID)
+
+var table hud = table.new(position.top_right, 2, 18, bgcolor = C_VOID, border_color = C_SURF, border_width = 1, frame_color = C_SHADOW, frame_width = 1)
+if barstate.islast and showHud and ready
+    bool trust = fw.dir != 0 or why == "" or st == 5 or st == 6
+    bool pjOk  = pjCall != 0 and pjMsg == "" and not na(pjEnt)
+    f_cell(hud, 0, 0, "shepherd", trust ? C_ACCENT : C_MUTE)
+    f_cell(hud, 1, 0, STATE.get(st), trust ? C_ACCENT : C_BRIGHT)
+    f_cell(hud, 0, 1, "regime", C_MUTE)
+    f_cell(hud, 1, 1, REG.get(reg), C_TEXT)
+    f_cell(hud, 0, 2, "velocity", C_MUTE)
+    f_cell(hud, 1, 2, f_n(nvWin, "+0.00;-0.00") + (thin ? "  thin" : ""), C_TEXT)
+    f_cell(hud, 0, 3, "effort ↑ ↓", C_MUTE)
+    f_cell(hud, 1, 3, f_n(effUp, "0.00") + "  " + f_n(effDn, "0.00"), C_TEXT)
+    f_cell(hud, 0, 4, "conflict", C_MUTE)
+    f_cell(hud, 1, 4, f_n(conflict, "0.00"), C_TEXT)
+    f_cell(hud, 0, 5, "passion", C_DIM)
+    f_cell(hud, 1, 5, "vector", C_DIM)
+    f_cell(hud, 0, 6, "  persistence", C_MUTE)
+    f_cell(hud, 1, 6, f_n(persist, "0.0") + "×", C_TEXT)
+    f_cell(hud, 0, 7, "  defense", C_MUTE)
+    f_cell(hud, 1, 7, domDir == 0 ? "—" : str.tostring(defDom), C_TEXT)
+    f_cell(hud, 0, 8, "  echo", C_MUTE)
+    f_cell(hud, 1, 8, f_arrow(echoDir) + "  run " + str.tostring(echoRun) + "  q " + f_n(echoQual, "+0.00;-0.00") + "  lat " + (na(echoLat) ? "—" : str.tostring(echoLat)), C_TEXT)
+    f_cell(hud, 0, 9, "  index", C_MUTE)
+    f_cell(hud, 1, 9, f_n(passionIdx, "0.00") + "  unvalidated", C_TEXT)
+    f_cell(hud, 0, 10, "normal rate", C_MUTE)
+    f_cell(hud, 1, 10, f_n(nDur, "0") + " bars  " + f_n(nMag, "0.0") + " atr  " + nSrc, C_TEXT)
+    f_cell(hud, 0, 11, "tempo", C_MUTE)
+    f_cell(hud, 1, 11, f_tempo(lastTempo) + " " + f_n(lastTempo, "0.0") + "×  amp " + f_n(lastAmp, "0.0") + "×  live " + f_n(liveTempo, "0.0") + "×", C_TEXT)
+    f_cell(hud, 0, 12, "pattern", C_MUTE)
+    f_cell(hud, 1, 12, memResolved < minMem ? "blank  " + str.tostring(memResolved) + "/" + str.tostring(minMem) : "p↑ " + f_n(pUp, "0.00") + "  base " + f_n(bUp, "0.00") + "  n " + str.tostring(memResolved), C_TEXT)
+    f_cell(hud, 0, 13, "identity", C_MUTE)
+    f_cell(hud, 1, 13, f_n(matchQ, "0.00") + "  lower = closer", C_TEXT)
+    f_cell(hud, 0, 14, "projection", C_MUTE)
+    f_cell(hud, 1, 14, pjCall == 0 ? "no call" : (pjCall == 1 ? "long" : "short") + "  p " + f_n(pjP, "0.00") + "  ev " + f_n(pjEv, "+0.00;-0.00") + "r", pjOk ? C_ACCENT : C_TEXT)
+    f_cell(hud, 0, 15, "entry plan", C_MUTE)
+    f_cell(hud, 1, 15, pjCall == 0 ? "—" : pjMsg != "" ? pjMsg : pjMode + "  @ " + str.tostring(pjEnt, format.mintick) + "  rr " + f_n(pjRR, "0.0"), pjOk ? C_ACCENT : C_TEXT)
+    f_cell(hud, 0, 16, "gate", C_MUTE)
+    f_cell(hud, 1, 16, why == "" ? "clear" : why, why == "" ? C_ACCENT : C_TEXT)
+    f_cell(hud, 0, 17, "trade", C_MUTE)
+    string ts = fw.dir == 0 ? "flat" : (fw.dir == 1 ? "long" : "short") + "  sl " + str.tostring(fw.sl, format.mintick) + "  tp " + str.tostring(fw.tp, format.mintick) + "  " + str.tostring(bar_index - fw.bar0) + "/" + str.tostring(fw.maxBars) + " bars  size " + f_n(fwSize, "#.####")
+    f_cell(hud, 1, 17, ts, fw.dir != 0 ? C_ACCENT : C_TEXT)
+
+var table vt = table.new(position.bottom_right, 4, 14, bgcolor = C_VOID, border_color = C_SURF, border_width = 1, frame_color = C_SHADOW, frame_width = 1)
+if barstate.islast and showVal
+    float expFw = fw.trades > 0 ? fw.sumR / fw.trades : na
+    float expPj = pj.trades > 0 ? pj.sumR / pj.trades : na
+    float expMo = mo.trades > 0 ? mo.sumR / mo.trades : na
+    float expRn = rn.trades > 0 ? rn.sumR / rn.trades : na
+    bool  fwBeats = fw.trades >= 30 and not na(expFw) and expFw > 0 and expFw > nz(expMo, -1e9) and expFw > nz(expRn, -1e9)
+    bool  pjBeats = pj.trades >= 30 and not na(expPj) and expPj > 0 and expPj > nz(expMo, -1e9) and expPj > nz(expRn, -1e9)
+    f_cell(vt, 0, 0, "validation", C_DIM)
+    f_cell(vt, 1, 0, "n", C_DIM)
+    f_cell(vt, 2, 0, "win", C_DIM)
+    f_cell(vt, 3, 0, "exp r", C_DIM)
+    f_cell(vt, 0, 1, "framework", fwBeats ? C_ACCENT : C_TEXT)
+    f_cell(vt, 1, 1, str.tostring(fw.trades), C_TEXT)
+    f_cell(vt, 2, 1, fw.trades > 0 ? f_n(100.0 * fw.wins / fw.trades, "0") + "%" : "—", C_TEXT)
+    f_cell(vt, 3, 1, f_n(expFw, "+0.00;-0.00"), na(expFw) ? C_TEXT : expFw > 0 ? C_GAIN : C_LOSS)
+    f_cell(vt, 0, 2, "projection", pjBeats ? C_ACCENT : C_TEXT)
+    f_cell(vt, 1, 2, str.tostring(pj.trades), C_TEXT)
+    f_cell(vt, 2, 2, pj.trades > 0 ? f_n(100.0 * pj.wins / pj.trades, "0") + "%" : "—", C_TEXT)
+    f_cell(vt, 3, 2, f_n(expPj, "+0.00;-0.00"), na(expPj) ? C_TEXT : expPj > 0 ? C_GAIN : C_LOSS)
+    f_cell(vt, 0, 3, "momentum", C_MUTE)
+    f_cell(vt, 1, 3, str.tostring(mo.trades), C_MUTE)
+    f_cell(vt, 2, 3, mo.trades > 0 ? f_n(100.0 * mo.wins / mo.trades, "0") + "%" : "—", C_MUTE)
+    f_cell(vt, 3, 3, f_n(expMo, "+0.00;-0.00"), C_MUTE)
+    f_cell(vt, 0, 4, "random", C_MUTE)
+    f_cell(vt, 1, 4, str.tostring(rn.trades), C_MUTE)
+    f_cell(vt, 2, 4, rn.trades > 0 ? f_n(100.0 * rn.wins / rn.trades, "0") + "%" : "—", C_MUTE)
+    f_cell(vt, 3, 4, f_n(expRn, "+0.00;-0.00"), C_MUTE)
+    f_cell(vt, 0, 5, "buy & hold", C_MUTE)
+    f_cell(vt, 1, 5, "", C_MUTE)
+    f_cell(vt, 2, 5, "", C_MUTE)
+    f_cell(vt, 3, 5, na(bh0) ? "—" : f_n(100.0 * (close / bh0 - 1.0), "+0.0;-0.0") + "%", C_MUTE)
+    f_cell(vt, 0, 6, "precursor", C_MUTE)
+    f_cell(vt, 1, 6, "probe " + (pcN > 0 ? f_n(float(pcHit) / pcN, "0.00") : "—"), C_TEXT)
+    f_cell(vt, 2, 6, "base " + (bsN > 0 ? f_n(float(bsHit) / bsN, "0.00") : "—"), C_TEXT)
+    f_cell(vt, 3, 6, "n " + str.tostring(pcN), C_MUTE)
+    f_cell(vt, 0, 7, "calibration", C_DIM)
+    f_cell(vt, 1, 7, "n", C_DIM)
+    f_cell(vt, 2, 7, "real", C_DIM)
+    f_cell(vt, 3, 7, "", C_DIM)
+    array<string> BIN = array.from("p .0–.2", "p .2–.4", "p .4–.6", "p .6–.8", "p .8–1")
+    for b = 0 to 4
+        int bn = calN.get(b)
+        f_cell(vt, 0, 8 + b, BIN.get(b), C_MUTE)
+        f_cell(vt, 1, 8 + b, str.tostring(bn), C_MUTE)
+        f_cell(vt, 2, 8 + b, bn > 0 ? f_n(float(calHit.get(b)) / bn, "0.00") : "—", C_TEXT)
+        f_cell(vt, 3, 8 + b, "", C_MUTE)
+    f_cell(vt, 0, 13, "pattern acc", C_MUTE)
+    f_cell(vt, 1, 13, "roll " + f_n(accRollV, "0.00"), C_TEXT)
+    f_cell(vt, 2, 13, "life " + f_n(accLife, "0.00"), C_TEXT)
+    f_cell(vt, 3, 13, decayed ? "degraded" : "holding", decayed ? C_LOSS : C_MUTE)
